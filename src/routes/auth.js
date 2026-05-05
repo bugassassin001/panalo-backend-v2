@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuid } from 'uuid';
 import { body, validationResult } from 'express-validator';
+import { createClient } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase.js';
 import { generateTokens, requireAuth } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/error.js';
@@ -49,6 +50,7 @@ router.post('/register', [
       plan,
       task_count:    0,
       token_version: 0,
+      auth_provider: 'email',
       created_at:    new Date().toISOString(),
     })
     .select()
@@ -95,6 +97,13 @@ router.post('/login', [
     return res.status(401).json({ error: 'Invalid email or password' });
   }
 
+  // Reject login attempts on Google-only accounts that don't have a password set
+  if (!user.password_hash) {
+    return res.status(401).json({
+      error: 'This account was created with Google. Please continue with Google.'
+    });
+  }
+
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) {
     logger.warn('Failed login attempt', { email });
@@ -109,6 +118,116 @@ router.post('/login', [
 
   res.json({
     message: 'Login successful',
+    user: sanitizeUser(user),
+    ...tokens,
+  });
+}));
+
+// ── POST /api/auth/google ────────────────────────────────────────────────────
+// Frontend completes Supabase Google OAuth, sends us the resulting Supabase
+// access_token. We verify it with Supabase, then either find or create the
+// matching user in OUR users table, and finally issue OUR custom JWTs.
+router.post('/google', [
+  body('access_token').isString().notEmpty(),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
+  const { access_token } = req.body;
+
+  // 1. Verify the Supabase token by asking Supabase who it belongs to
+  const supaAuth = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY
+  );
+  const { data: gData, error: gErr } = await supaAuth.auth.getUser(access_token);
+  if (gErr || !gData?.user) {
+    logger.warn('Google sign-in: invalid Supabase token', { error: gErr?.message });
+    return res.status(401).json({ error: 'Invalid Google sign-in token' });
+  }
+
+  const supaUser = gData.user;
+  const email = (supaUser.email || '').toLowerCase().trim();
+  const googleId = supaUser.user_metadata?.provider_id || supaUser.user_metadata?.sub || supaUser.id;
+  const fullName = supaUser.user_metadata?.full_name || supaUser.user_metadata?.name || '';
+  const [first_name = '', ...rest] = fullName.split(' ');
+  const last_name = rest.join(' ') || '';
+  const avatar_url = supaUser.user_metadata?.avatar_url || supaUser.user_metadata?.picture || null;
+
+  if (!email) {
+    return res.status(400).json({ error: 'Google account has no email' });
+  }
+
+  // 2. Try to find an existing user by google_id, then by email
+  let { data: user } = await supabase
+    .from('users')
+    .select('*')
+    .eq('google_id', googleId)
+    .single();
+
+  if (!user) {
+    const { data: byEmail } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+    user = byEmail || null;
+  }
+
+  // 3a. New user — create the account
+  if (!user) {
+    const { data: created, error: insErr } = await supabase
+      .from('users')
+      .insert({
+        id: uuid(),
+        email,
+        password_hash: null,
+        first_name: first_name || email.split('@')[0],
+        last_name,
+        google_id: googleId,
+        avatar_url,
+        role: 'client',
+        plan: 'starter',
+        task_count: 0,
+        token_version: 0,
+        auth_provider: 'google',
+        created_at: new Date().toISOString(),
+        last_login: new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    if (insErr) {
+      logger.error('Google sign-up failed', { email, error: insErr.message });
+      return res.status(500).json({ error: 'Could not create account' });
+    }
+    user = created;
+
+    sendWelcomeEmail(user).catch(err => logger.warn('Welcome email failed', { error: err.message }));
+    logger.info('User registered via Google', { userId: user.id, email });
+  } else {
+    // 3b. Existing user — link google_id if not already linked, update last login
+    const updates = { last_login: new Date().toISOString() };
+    if (!user.google_id) updates.google_id = googleId;
+    if (!user.avatar_url && avatar_url) updates.avatar_url = avatar_url;
+
+    const { data: updated } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', user.id)
+      .select()
+      .single();
+
+    if (updated) user = updated;
+    logger.info('User logged in via Google', { userId: user.id, email });
+  }
+
+  // 4. Issue OUR custom JWTs (same shape as /login and /register)
+  const tokens = generateTokens(user);
+  res.json({
+    message: 'Google sign-in successful',
     user: sanitizeUser(user),
     ...tokens,
   });

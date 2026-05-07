@@ -50,7 +50,6 @@ router.post('/register', [
       plan,
       task_count:    0,
       token_version: 0,
-      auth_provider: 'email',
       created_at:    new Date().toISOString(),
     })
     .select()
@@ -79,13 +78,14 @@ router.post('/register', [
 router.post('/login', [
   body('email').isEmail().normalizeEmail(),
   body('password').notEmpty(),
+  body('expected_role').optional().isIn(['client','agent','admin']),
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
   }
 
-  const { email, password } = req.body;
+  const { email, password, expected_role } = req.body;
 
   const { data: user } = await supabase
     .from('users')
@@ -110,11 +110,24 @@ router.post('/login', [
     return res.status(401).json({ error: 'Invalid email or password' });
   }
 
+  // Role-mismatch guard: if the caller said which role they expected (e.g. the
+  // Client/Agent tab they used, or the admin login page), reject mismatches
+  // with a clear message instead of silently logging them in.
+  if (expected_role && user.role !== expected_role) {
+    const friendly = {
+      client: 'This is not a client account. Use the correct sign-in option.',
+      agent:  'This is not an agent account. Use the correct sign-in option.',
+      admin:  'This account does not have admin access.'
+    };
+    logger.warn('Role mismatch on login', { email, userRole: user.role, expected_role });
+    return res.status(403).json({ error: friendly[expected_role] || 'Wrong sign-in type for this account.' });
+  }
+
   // Update last login
   await supabase.from('users').update({ last_login: new Date().toISOString() }).eq('id', user.id);
 
   const tokens = generateTokens(user);
-  logger.info('User logged in', { userId: user.id, email });
+  logger.info('User logged in', { userId: user.id, email, role: user.role });
 
   res.json({
     message: 'Login successful',
@@ -124,9 +137,9 @@ router.post('/login', [
 }));
 
 // ── POST /api/auth/google ────────────────────────────────────────────────────
-// Frontend completes Supabase Google OAuth, sends us the resulting Supabase
-// access_token. We verify it with Supabase, then either find or create the
-// matching user in OUR users table, and finally issue OUR custom JWTs.
+// Frontend completes Supabase Google OAuth, then sends us the resulting
+// Supabase access_token. We verify it with Supabase, then either find
+// or create a matching user (always role='client') and issue OUR custom JWTs.
 router.post('/google', [
   body('access_token').isString().notEmpty(),
 ], asyncHandler(async (req, res) => {
@@ -137,7 +150,6 @@ router.post('/google', [
 
   const { access_token } = req.body;
 
-  // 1. Verify the Supabase token by asking Supabase who it belongs to
   const supaAuth = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_ANON_KEY
@@ -160,7 +172,6 @@ router.post('/google', [
     return res.status(400).json({ error: 'Google account has no email' });
   }
 
-  // 2. Try to find an existing user by google_id, then by email
   let { data: user } = await supabase
     .from('users')
     .select('*')
@@ -176,8 +187,8 @@ router.post('/google', [
     user = byEmail || null;
   }
 
-  // 3a. New user — create the account
   if (!user) {
+    // New user — always create as 'client' (no agent self-signup via Google)
     const { data: created, error: insErr } = await supabase
       .from('users')
       .insert({
@@ -198,33 +209,35 @@ router.post('/google', [
       })
       .select()
       .single();
-
     if (insErr) {
       logger.error('Google sign-up failed', { email, error: insErr.message });
       return res.status(500).json({ error: 'Could not create account' });
     }
     user = created;
-
     sendWelcomeEmail(user).catch(err => logger.warn('Welcome email failed', { error: err.message }));
     logger.info('User registered via Google', { userId: user.id, email });
   } else {
-    // 3b. Existing user — link google_id if not already linked, update last login
+    // Block agents and admins from signing in via Google (which would create a
+    // role='client' on first contact). Forces them to use email/password.
+    if (user.role !== 'client') {
+      logger.warn('Google sign-in blocked for non-client role', { email, role: user.role });
+      return res.status(403).json({
+        error: 'Google sign-in is only available for clients. Please sign in with email and password.'
+      });
+    }
     const updates = { last_login: new Date().toISOString() };
     if (!user.google_id) updates.google_id = googleId;
     if (!user.avatar_url && avatar_url) updates.avatar_url = avatar_url;
-
     const { data: updated } = await supabase
       .from('users')
       .update(updates)
       .eq('id', user.id)
       .select()
       .single();
-
     if (updated) user = updated;
     logger.info('User logged in via Google', { userId: user.id, email });
   }
 
-  // 4. Issue OUR custom JWTs (same shape as /login and /register)
   const tokens = generateTokens(user);
   res.json({
     message: 'Google sign-in successful',

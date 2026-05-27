@@ -51,7 +51,11 @@ async function verifyTurnstile(token, remoteip) {
 // ── POST /api/leads/submit ──────────────────────────────────────────────────
 // Public endpoint — no auth required. Guests submit a task from the homepage.
 router.post('/submit', leadsLimiter, [
-  body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
+  // Validate format, but DO NOT normalize — we want to preserve the exact
+  // email the visitor typed (dots, +tags, etc.) so replies go to what they expect.
+  body('email').isEmail().withMessage('Valid email required')
+    .isLength({ max: 254 })   // RFC 5321 max length
+    .customSanitizer((v) => String(v || '').trim()),
   body('task').isString().trim().isLength({ min: 5, max: 2000 }).withMessage('Task must be 5–2000 characters'),
   body('website').optional().isString(),           // honeypot — must be empty
   body('turnstile_token').optional().isString(),

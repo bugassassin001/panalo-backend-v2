@@ -3,12 +3,31 @@ import { logger } from './logger.js';
 /**
  * Send email via Resend API
  * Falls back to console logging in development
+ *
+ * @param {object} opts
+ * @param {string|string[]} opts.to        - Primary recipient(s)
+ * @param {string[]}        [opts.bcc]     - BCC recipients (kept hidden from `to`)
+ * @param {string|string[]} [opts.replyTo] - Reply-To header (so inbox replies go to a different address)
+ * @param {string}          opts.subject
+ * @param {string}          [opts.html]
+ * @param {string}          [opts.text]
  */
-async function sendEmail({ to, subject, html, text }) {
+async function sendEmail({ to, bcc, replyTo, subject, html, text }) {
   if (!process.env.RESEND_API_KEY || process.env.NODE_ENV === 'development') {
-    logger.info('📧 [DEV] Email would be sent', { to, subject });
+    logger.info('📧 [DEV] Email would be sent', { to, bcc, replyTo, subject });
     return { id: 'dev-mode', message: 'Email logged in dev mode' };
   }
+
+  // Resend accepts `to` as string or array
+  const payload = {
+    from:    process.env.EMAIL_FROM || 'Panalo.ai <hello@panalo.ai>',
+    to:      Array.isArray(to) ? to : [to],
+    subject,
+    html,
+    text,
+  };
+  if (bcc && bcc.length)         payload.bcc       = Array.isArray(bcc) ? bcc : [bcc];
+  if (replyTo)                   payload.reply_to  = Array.isArray(replyTo) ? replyTo : [replyTo];
 
   const res = await fetch('https://api.resend.com/emails', {
     method:  'POST',
@@ -16,11 +35,7 @@ async function sendEmail({ to, subject, html, text }) {
       'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
       'Content-Type':  'application/json',
     },
-    body: JSON.stringify({
-      from:    process.env.EMAIL_FROM || 'Panalo.ai <hello@panalo.ai>',
-      to:      [to],
-      subject, html, text,
-    }),
+    body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
@@ -54,7 +69,7 @@ export async function sendWelcomeEmail(user) {
             <li>Watch AI attempt it in real time</li>
             <li>Chat with your agent if it escalates</li>
           </ol>
-          <a href="${process.env.FRONTEND_URL}/dashboard" 
+          <a href="${process.env.FRONTEND_URL}/dashboard"
              style="display:inline-block;background:#0f8c7e;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600">
             Go to Dashboard →
           </a>
@@ -159,5 +174,67 @@ export async function sendPasswordResetEmail(user, token) {
         <p style="color:#9b948e;font-size:13px">If you didn't request this, you can safely ignore this email.</p>
       </div>`,
     text: `Reset your Panalo.ai password: ${resetUrl}`,
+  });
+}
+
+/**
+ * Lead notification — sent to the Panalo team when a guest submits the hero form.
+ * Primary recipient is LEADS_TO_EMAIL, with the rest of the team BCC'd.
+ * Reply-To is set to the guest's email so hitting Reply in your inbox goes to them.
+ */
+export async function sendLeadNotificationEmail({ leadEmail, task, ip, userAgent, source, pageUrl }) {
+  const to    = process.env.LEADS_TO_EMAIL || 'hello@panalo.ai';
+  const bcc   = (process.env.LEADS_BCC || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const when  = new Date().toLocaleString('en-US', {
+    timeZone: 'Asia/Manila', dateStyle: 'medium', timeStyle: 'short',
+  });
+  const safeTask = String(task || '').slice(0, 2000);
+  const preview  = safeTask.length > 80 ? safeTask.slice(0, 80) + '…' : safeTask;
+  // Escape HTML in user-provided fields (basic XSS prevention for the email body)
+  const esc = (s) => String(s || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+
+  return sendEmail({
+    to,
+    bcc,
+    replyTo: leadEmail,
+    subject: `[Panalo Lead] ${preview}`,
+    html: `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;background:#faf9f6;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#0f8c7e,#1a1a26);padding:24px 32px;color:white">
+          <div style="font-size:13px;opacity:.85;letter-spacing:.5px">NEW LEAD · PANALO.AI</div>
+          <h2 style="margin:6px 0 0;font-size:22px;color:white">A visitor submitted a task</h2>
+        </div>
+        <div style="padding:24px 32px;color:#2a2520">
+          <div style="margin-bottom:18px">
+            <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">FROM</div>
+            <div style="font-size:15px"><a href="mailto:${esc(leadEmail)}" style="color:#0f8c7e;text-decoration:none;font-weight:600">${esc(leadEmail)}</a></div>
+          </div>
+          <div style="margin-bottom:18px">
+            <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">TASK</div>
+            <div style="background:white;border-left:3px solid #0f8c7e;padding:14px 18px;border-radius:0 8px 8px 0;font-size:14px;line-height:1.55;white-space:pre-wrap">${esc(safeTask)}</div>
+          </div>
+          <table style="width:100%;font-size:13px;color:#6b6560;border-collapse:collapse;margin-top:18px">
+            <tr><td style="padding:4px 0;width:120px;color:#9b948e">Received</td><td>${esc(when)} PHT</td></tr>
+            <tr><td style="padding:4px 0;color:#9b948e">Source</td><td>${esc(source || 'homepage_hero')}</td></tr>
+            ${pageUrl ? `<tr><td style="padding:4px 0;color:#9b948e">Page</td><td><a href="${esc(pageUrl)}" style="color:#0f8c7e">${esc(pageUrl)}</a></td></tr>` : ''}
+            ${ip ? `<tr><td style="padding:4px 0;color:#9b948e">IP</td><td>${esc(ip)}</td></tr>` : ''}
+            ${userAgent ? `<tr><td style="padding:4px 0;color:#9b948e;vertical-align:top">User agent</td><td style="font-size:11px;color:#9b948e">${esc(userAgent.slice(0, 200))}</td></tr>` : ''}
+          </table>
+          <div style="margin-top:24px;padding-top:18px;border-top:1px solid #e2ddd8;font-size:13px">
+            <strong>Reply directly</strong> — hitting Reply on this email will send to ${esc(leadEmail)} (not to the team alias).
+          </div>
+        </div>
+      </div>`,
+    text:
+      `New lead from ${leadEmail}\n\n` +
+      `Task:\n${safeTask}\n\n` +
+      `Received: ${when} PHT\n` +
+      `Source: ${source || 'homepage_hero'}\n` +
+      (pageUrl ? `Page: ${pageUrl}\n` : '') +
+      (ip ? `IP: ${ip}\n` : '') +
+      `\nReply directly to ${leadEmail}.`,
   });
 }

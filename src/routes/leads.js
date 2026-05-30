@@ -3,7 +3,7 @@ import { body, validationResult } from 'express-validator';
 import rateLimit from 'express-rate-limit';
 import { supabase } from '../lib/supabase.js';
 import { asyncHandler } from '../middleware/error.js';
-import { sendLeadNotificationEmail } from '../lib/email.js';
+import { sendLeadNotificationEmail, sendLeadEscalationEmail } from '../lib/email.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
@@ -15,6 +15,16 @@ const leadsLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many submissions from this IP. Please try again later.' },
+});
+
+// Slightly more generous for /escalate since the visitor has already passed
+// /submit (proven non-bot). 10/hour/IP.
+const escalateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many escalations from this IP. Please try again later.' },
 });
 
 // ── Helper: verify Cloudflare Turnstile token ───────────────────────────────
@@ -43,21 +53,20 @@ async function verifyTurnstile(token, remoteip) {
     return { ok: true };
   } catch (err) {
     logger.error('Turnstile verify call errored', { error: err.message });
-    // Fail closed — if the verifier itself failed, treat as suspicious
     return { ok: false, reason: 'verifier_unreachable' };
   }
 }
 
 // ── POST /api/leads/submit ──────────────────────────────────────────────────
-// Public endpoint — no auth required. Guests submit a task from the homepage.
+// Public endpoint — no auth required. Visitor submits a task from the homepage.
+// (This endpoint is still used for non-AI submissions; the new AI flow uses
+//  /api/ai/preview which creates the lead row server-side.)
 router.post('/submit', leadsLimiter, [
-  // Validate format, but DO NOT normalize — we want to preserve the exact
-  // email the visitor typed (dots, +tags, etc.) so replies go to what they expect.
   body('email').isEmail().withMessage('Valid email required')
-    .isLength({ max: 254 })   // RFC 5321 max length
+    .isLength({ max: 254 })
     .customSanitizer((v) => String(v || '').trim()),
   body('task').isString().trim().isLength({ min: 5, max: 2000 }).withMessage('Task must be 5–2000 characters'),
-  body('website').optional().isString(),           // honeypot — must be empty
+  body('website').optional().isString(),
   body('turnstile_token').optional().isString(),
   body('source').optional().isString().isLength({ max: 60 }),
   body('page_url').optional().isString().isLength({ max: 500 }),
@@ -69,63 +78,113 @@ router.post('/submit', leadsLimiter, [
 
   const { email, task, website, turnstile_token, source, page_url } = req.body;
 
-  // 1. Honeypot check — bots typically fill all visible fields
   if (website && website.trim().length > 0) {
     logger.warn('Lead rejected: honeypot triggered', { email, ip: req.ip });
-    // Return 200 to not tip off the bot that we caught it
     return res.json({ ok: true });
   }
 
-  // 2. Verify Cloudflare Turnstile
   const turnstile = await verifyTurnstile(turnstile_token, req.ip);
   if (!turnstile.ok) {
-    logger.warn('Lead rejected: bot check failed', {
-      email, ip: req.ip, reason: turnstile.reason,
-    });
+    logger.warn('Lead rejected: bot check failed', { email, ip: req.ip, reason: turnstile.reason });
     return res.status(403).json({ error: 'Verification failed. Please refresh and try again.' });
   }
 
-  // 3. Best-effort insert into leads table (don't block email on DB failure)
   const userAgent = (req.get('user-agent') || '').slice(0, 500);
-  const insertPayload = {
-    email,
-    task,
-    ip: req.ip,
-    user_agent: userAgent,
-    source: source || 'homepage_hero',
-    page_url: page_url || null,
-    status: 'new',
-  };
   const { data: lead, error: dbErr } = await supabase
     .from('leads')
-    .insert(insertPayload)
+    .insert({
+      email, task,
+      ip: req.ip,
+      user_agent: userAgent,
+      source: source || 'homepage_hero',
+      page_url: page_url || null,
+      status: 'new',
+    })
     .select()
     .single();
 
   if (dbErr) {
-    logger.error('Lead DB insert failed (will still send email)', {
-      email, error: dbErr.message,
-    });
+    logger.error('Lead DB insert failed (will still send email)', { email, error: dbErr.message });
   }
 
-  // 4. Send the team notification email (don't fail the request if email fails;
-  //    the lead is already saved in the DB).
   try {
     await sendLeadNotificationEmail({
-      leadEmail: email,
-      task,
-      ip: req.ip,
-      userAgent,
+      leadEmail: email, task,
+      ip: req.ip, userAgent,
       source: source || 'homepage_hero',
       pageUrl: page_url,
     });
     logger.info('Lead notification sent', { email, leadId: lead?.id });
   } catch (err) {
     logger.error('Lead email send failed', { email, error: err.message });
-    // Still return success to the user — we have the lead in the DB
   }
 
   res.json({ ok: true, message: 'Thanks — we\'ll be in touch within 24 hours.' });
+}));
+
+// ── POST /api/leads/escalate ────────────────────────────────────────────────
+// Called when a visitor clicks "Request Human Review" after the AI preview.
+// We update the existing lead row (created by /api/ai/preview), then send
+// an escalation email to the team with the original task + AI output for context.
+router.post('/escalate', escalateLimiter, [
+  body('lead_id').isUUID().withMessage('lead_id required'),
+  body('reason').optional().isString().trim().isLength({ max: 500 }),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: errors.array()[0]?.msg || 'Invalid input' });
+  }
+
+  const { lead_id, reason } = req.body;
+
+  // 1. Fetch the lead so we have task + email + AI output context
+  const { data: lead, error: fetchErr } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('id', lead_id)
+    .single();
+
+  if (fetchErr || !lead) {
+    logger.warn('Escalate: lead not found', { lead_id, error: fetchErr?.message });
+    return res.status(404).json({ error: 'Lead not found' });
+  }
+
+  // 2. Update the lead status to escalated
+  const { error: updateErr } = await supabase
+    .from('leads')
+    .update({
+      status: 'escalated',
+      escalated_at: new Date().toISOString(),
+      escalation_reason: reason || null,
+    })
+    .eq('id', lead_id);
+
+  if (updateErr) {
+    logger.error('Escalate: status update failed', { lead_id, error: updateErr.message });
+    // Continue anyway — we still want to send the email
+  }
+
+  // 3. Send escalation email to the team with full context
+  try {
+    await sendLeadEscalationEmail({
+      leadEmail: lead.email,
+      task: lead.task,
+      aiOutput: lead.ai_output,
+      aiConfidence: lead.ai_confidence,
+      reason,
+      leadId: lead.id,
+      submittedAt: lead.created_at,
+    });
+    logger.info('Lead escalation email sent', { lead_id, email: lead.email });
+  } catch (err) {
+    logger.error('Escalation email send failed', { lead_id, error: err.message });
+    // Lead is already marked escalated in DB — return success to user
+  }
+
+  res.json({
+    ok: true,
+    message: 'Escalated to our team — you\'ll hear back within 2 hours.',
+  });
 }));
 
 export default router;

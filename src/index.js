@@ -22,7 +22,8 @@ import messageRoutes   from './routes/messages.js';
 import billingRoutes   from './routes/billing.js';
 import adminRoutes     from './routes/admin.js';
 import webhookRoutes   from './routes/webhooks.js';
-import leadsRoutes     from './routes/leads.js';   // ← NEW
+import leadsRoutes     from './routes/leads.js';
+import aiRoutes        from './routes/ai.js';        // ← NEW
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -108,7 +109,8 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/billing',  billingRoutes);
 app.use('/api/admin',    adminRoutes);
 app.use('/api/webhooks', webhookRoutes);
-app.use('/api/leads',    leadsRoutes);    // ← NEW (its own per-IP rate limit lives inside the router)
+app.use('/api/leads',    leadsRoutes);   // ← NEW (or already mounted)
+app.use('/api/ai',       aiRoutes);      // ← NEW
 
 // ── 404 + Error handling ─────────────────────────────────────────────────────
 app.use(notFound);

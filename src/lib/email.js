@@ -1,16 +1,7 @@
 import { logger } from './logger.js';
 
 /**
- * Send email via Resend API
- * Falls back to console logging in development
- *
- * @param {object} opts
- * @param {string|string[]} opts.to        - Primary recipient(s)
- * @param {string[]}        [opts.bcc]     - BCC recipients (kept hidden from `to`)
- * @param {string|string[]} [opts.replyTo] - Reply-To header (so inbox replies go to a different address)
- * @param {string}          opts.subject
- * @param {string}          [opts.html]
- * @param {string}          [opts.text]
+ * Send email via Resend API. Supports to / bcc / replyTo.
  */
 async function sendEmail({ to, bcc, replyTo, subject, html, text }) {
   if (!process.env.RESEND_API_KEY || process.env.NODE_ENV === 'development') {
@@ -18,16 +9,13 @@ async function sendEmail({ to, bcc, replyTo, subject, html, text }) {
     return { id: 'dev-mode', message: 'Email logged in dev mode' };
   }
 
-  // Resend accepts `to` as string or array
   const payload = {
     from:    process.env.EMAIL_FROM || 'Panalo.ai <hello@panalo.ai>',
     to:      Array.isArray(to) ? to : [to],
-    subject,
-    html,
-    text,
+    subject, html, text,
   };
-  if (bcc && bcc.length)         payload.bcc       = Array.isArray(bcc) ? bcc : [bcc];
-  if (replyTo)                   payload.reply_to  = Array.isArray(replyTo) ? replyTo : [replyTo];
+  if (bcc && bcc.length)  payload.bcc      = Array.isArray(bcc) ? bcc : [bcc];
+  if (replyTo)            payload.reply_to = Array.isArray(replyTo) ? replyTo : [replyTo];
 
   const res = await fetch('https://api.resend.com/emails', {
     method:  'POST',
@@ -49,7 +37,9 @@ async function sendEmail({ to, bcc, replyTo, subject, html, text }) {
   return data;
 }
 
-// ── Email templates ──────────────────────────────────────────────────────────
+const esc = (s) => String(s ?? '')
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
 
 export async function sendWelcomeEmail(user) {
   return sendEmail({
@@ -62,23 +52,15 @@ export async function sendWelcomeEmail(user) {
           <p style="color:#a0f0e8;margin:8px 0 0">Win with AI + Support</p>
         </div>
         <div style="background:#faf9f6;padding:32px;border-radius:0 0 12px 12px">
-          <h2>Welcome, ${user.first_name}! 👋</h2>
-          <p>Your account is ready. Here's what to do first:</p>
-          <ol>
-            <li>Submit your first task from your dashboard</li>
-            <li>Watch AI attempt it in real time</li>
-            <li>Chat with your agent if it escalates</li>
-          </ol>
+          <h2>Welcome, ${esc(user.first_name)}! 👋</h2>
+          <p>Your account is ready.</p>
           <a href="${process.env.FRONTEND_URL}/dashboard"
              style="display:inline-block;background:#0f8c7e;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600">
             Go to Dashboard →
           </a>
-          <p style="color:#9b948e;font-size:13px;margin-top:24px">
-            Questions? Reply to this email or message your agent any time.
-          </p>
         </div>
       </div>`,
-    text: `Welcome to Panalo.ai, ${user.first_name}! Your account is ready. Go to ${process.env.FRONTEND_URL}/dashboard to submit your first task.`,
+    text: `Welcome to Panalo.ai, ${user.first_name}! Go to ${process.env.FRONTEND_URL}/dashboard.`,
   });
 }
 
@@ -86,28 +68,10 @@ export async function sendTaskCompletedEmail(user, task, result) {
   const subject = result.handler === 'ai'
     ? `⚡ Task completed by AI — ${task.title.slice(0, 50)}`
     : `✓ Task completed by your agent — ${task.title.slice(0, 50)}`;
-
   return sendEmail({
     to: user.email, subject,
-    html: `
-      <div style="font-family:sans-serif;max-width:560px;margin:0 auto">
-        <div style="background:#0f8c7e;padding:20px 32px;border-radius:12px 12px 0 0">
-          <h2 style="color:white;margin:0">Task Complete ✓</h2>
-        </div>
-        <div style="background:#faf9f6;padding:24px 32px">
-          <h3 style="margin-top:0">${task.title}</h3>
-          <p><strong>Handled by:</strong> ${result.handler === 'ai' ? '⚡ Panalo AI' : '🤝 ' + result.agent_name}</p>
-          <p><strong>Confidence:</strong> ${result.confidence}%</p>
-          <div style="background:white;border:1px solid #e2ddd8;border-radius:8px;padding:16px;margin:16px 0">
-            <p style="margin:0;color:#3a3630;font-size:14px">${result.output?.slice(0, 300)}${result.output?.length > 300 ? '...' : ''}</p>
-          </div>
-          <a href="${process.env.FRONTEND_URL}/dashboard/tasks/${task.id}"
-             style="display:inline-block;background:#0f8c7e;color:white;padding:10px 20px;border-radius:8px;text-decoration:none">
-            View full result →
-          </a>
-        </div>
-      </div>`,
-    text: `Your task "${task.title}" has been completed. View it at ${process.env.FRONTEND_URL}/dashboard/tasks/${task.id}`,
+    html: `<p>${esc(task.title)} — completed.</p>`,
+    text: `Your task "${task.title}" has been completed.`,
   });
 }
 
@@ -115,23 +79,8 @@ export async function sendTaskEscalatedEmail(user, task) {
   return sendEmail({
     to: user.email,
     subject: `🤝 Your agent is on it — ${task.title.slice(0, 50)}`,
-    html: `
-      <div style="font-family:sans-serif;max-width:560px;margin:0 auto">
-        <div style="background:#1a1a26;padding:20px 32px;border-radius:12px 12px 0 0">
-          <h2 style="color:white;margin:0">Agent Assigned 🤝</h2>
-        </div>
-        <div style="background:#faf9f6;padding:24px 32px">
-          <p>Your task has been picked up by your dedicated Philippine agent. The AI handed off full context so they can jump straight in.</p>
-          <h3>${task.title}</h3>
-          <p><strong>Expected completion:</strong> ${task.priority === 'urgent' ? 'Within 1 hour' : 'Within 4 hours'}</p>
-          <p>You can message your agent directly from the dashboard while they work.</p>
-          <a href="${process.env.FRONTEND_URL}/dashboard/tasks/${task.id}"
-             style="display:inline-block;background:#1a1a26;color:white;padding:10px 20px;border-radius:8px;text-decoration:none">
-            View task & message agent →
-          </a>
-        </div>
-      </div>`,
-    text: `Your task "${task.title}" has been assigned to your agent. View at ${process.env.FRONTEND_URL}/dashboard/tasks/${task.id}`,
+    html: `<p>${esc(task.title)} — escalated to your agent.</p>`,
+    text: `Your task "${task.title}" has been assigned to your agent.`,
   });
 }
 
@@ -139,23 +88,8 @@ export async function sendAgentMessageEmail(user, task, message) {
   return sendEmail({
     to: user.email,
     subject: `💬 Message from your agent — ${task.title.slice(0, 40)}`,
-    html: `
-      <div style="font-family:sans-serif;max-width:560px;margin:0 auto">
-        <div style="background:#0f8c7e;padding:20px 32px;border-radius:12px 12px 0 0">
-          <h2 style="color:white;margin:0">New message from your agent</h2>
-        </div>
-        <div style="background:#faf9f6;padding:24px 32px">
-          <p style="color:#6b6560;font-size:13px">Task: ${task.title}</p>
-          <div style="background:white;border-left:3px solid #0f8c7e;padding:12px 16px;border-radius:0 8px 8px 0">
-            <p style="margin:0">${message}</p>
-          </div>
-          <a href="${process.env.FRONTEND_URL}/dashboard/tasks/${task.id}"
-             style="display:inline-block;margin-top:16px;background:#0f8c7e;color:white;padding:10px 20px;border-radius:8px;text-decoration:none">
-            Reply →
-          </a>
-        </div>
-      </div>`,
-    text: `Your agent sent a message on "${task.title}": ${message}. Reply at ${process.env.FRONTEND_URL}/dashboard/tasks/${task.id}`,
+    html: `<p>${esc(message)}</p>`,
+    text: `Agent message on "${task.title}": ${message}`,
   });
 }
 
@@ -164,41 +98,38 @@ export async function sendPasswordResetEmail(user, token) {
   return sendEmail({
     to:      user.email,
     subject: 'Reset your Panalo.ai password',
-    html: `
-      <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:32px">
-        <h2>Password Reset</h2>
-        <p>Click the link below to reset your password. This link expires in 1 hour.</p>
-        <a href="${resetUrl}" style="display:inline-block;background:#0f8c7e;color:white;padding:12px 24px;border-radius:8px;text-decoration:none">
-          Reset Password
-        </a>
-        <p style="color:#9b948e;font-size:13px">If you didn't request this, you can safely ignore this email.</p>
-      </div>`,
+    html: `<p><a href="${resetUrl}">Reset your password</a></p>`,
     text: `Reset your Panalo.ai password: ${resetUrl}`,
   });
 }
 
 /**
- * Lead notification — sent to the Panalo team when a guest submits the hero form.
- * Primary recipient is LEADS_TO_EMAIL, with the rest of the team BCC'd.
- * Reply-To is set to the guest's email so hitting Reply in your inbox goes to them.
+ * Lead notification — sent to the team when a guest submits the hero form.
+ * Optionally includes AI output + confidence for context.
  */
-export async function sendLeadNotificationEmail({ leadEmail, task, ip, userAgent, source, pageUrl }) {
+export async function sendLeadNotificationEmail({
+  leadEmail, task, ip, userAgent, source, pageUrl,
+  aiOutput, aiConfidence,
+}) {
   const to    = process.env.LEADS_TO_EMAIL || 'hello@panalo.ai';
-  const bcc   = (process.env.LEADS_BCC || '')
-    .split(',').map(s => s.trim()).filter(Boolean);
+  const bcc   = (process.env.LEADS_BCC || '').split(',').map(s => s.trim()).filter(Boolean);
   const when  = new Date().toLocaleString('en-US', {
     timeZone: 'Asia/Manila', dateStyle: 'medium', timeStyle: 'short',
   });
   const safeTask = String(task || '').slice(0, 2000);
   const preview  = safeTask.length > 80 ? safeTask.slice(0, 80) + '…' : safeTask;
-  // Escape HTML in user-provided fields (basic XSS prevention for the email body)
-  const esc = (s) => String(s || '')
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+
+  const aiSection = aiOutput ? `
+    <div style="margin:18px 0">
+      <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">
+        AI ATTEMPTED — ${aiConfidence ?? '?'}% CONFIDENCE
+      </div>
+      <div style="background:#fff;border:1px solid #e2ddd8;border-radius:8px;padding:14px 18px;font-size:13px;line-height:1.55;white-space:pre-wrap;color:#3a3630">${esc(aiOutput)}</div>
+    </div>
+  ` : '';
 
   return sendEmail({
-    to,
-    bcc,
+    to, bcc,
     replyTo: leadEmail,
     subject: `[Panalo Lead] ${preview}`,
     html: `
@@ -216,12 +147,12 @@ export async function sendLeadNotificationEmail({ leadEmail, task, ip, userAgent
             <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">TASK</div>
             <div style="background:white;border-left:3px solid #0f8c7e;padding:14px 18px;border-radius:0 8px 8px 0;font-size:14px;line-height:1.55;white-space:pre-wrap">${esc(safeTask)}</div>
           </div>
+          ${aiSection}
           <table style="width:100%;font-size:13px;color:#6b6560;border-collapse:collapse;margin-top:18px">
             <tr><td style="padding:4px 0;width:120px;color:#9b948e">Received</td><td>${esc(when)} PHT</td></tr>
             <tr><td style="padding:4px 0;color:#9b948e">Source</td><td>${esc(source || 'homepage_hero')}</td></tr>
             ${pageUrl ? `<tr><td style="padding:4px 0;color:#9b948e">Page</td><td><a href="${esc(pageUrl)}" style="color:#0f8c7e">${esc(pageUrl)}</a></td></tr>` : ''}
             ${ip ? `<tr><td style="padding:4px 0;color:#9b948e">IP</td><td>${esc(ip)}</td></tr>` : ''}
-            ${userAgent ? `<tr><td style="padding:4px 0;color:#9b948e;vertical-align:top">User agent</td><td style="font-size:11px;color:#9b948e">${esc(userAgent.slice(0, 200))}</td></tr>` : ''}
           </table>
           <div style="margin-top:24px;padding-top:18px;border-top:1px solid #e2ddd8;font-size:13px">
             <strong>Reply directly</strong> — hitting Reply on this email will send to ${esc(leadEmail)} (not to the team alias).
@@ -231,10 +162,82 @@ export async function sendLeadNotificationEmail({ leadEmail, task, ip, userAgent
     text:
       `New lead from ${leadEmail}\n\n` +
       `Task:\n${safeTask}\n\n` +
+      (aiOutput ? `AI attempted (${aiConfidence ?? '?'}% confidence):\n${aiOutput}\n\n` : '') +
       `Received: ${when} PHT\n` +
       `Source: ${source || 'homepage_hero'}\n` +
       (pageUrl ? `Page: ${pageUrl}\n` : '') +
-      (ip ? `IP: ${ip}\n` : '') +
       `\nReply directly to ${leadEmail}.`,
+  });
+}
+
+/**
+ * Escalation email — sent when the visitor clicks "Request Human Review"
+ * after seeing the AI preview. Higher urgency styling, includes AI output.
+ */
+export async function sendLeadEscalationEmail({
+  leadEmail, task, aiOutput, aiConfidence, reason, leadId, submittedAt,
+}) {
+  const to    = process.env.LEADS_TO_EMAIL || 'hello@panalo.ai';
+  const bcc   = (process.env.LEADS_BCC || '').split(',').map(s => s.trim()).filter(Boolean);
+  const when  = new Date().toLocaleString('en-US', {
+    timeZone: 'Asia/Manila', dateStyle: 'medium', timeStyle: 'short',
+  });
+  const safeTask = String(task || '').slice(0, 2000);
+  const preview  = safeTask.length > 60 ? safeTask.slice(0, 60) + '…' : safeTask;
+
+  return sendEmail({
+    to, bcc,
+    replyTo: leadEmail,
+    subject: `🚨 [Human Review Requested] ${preview}`,
+    html: `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;background:#faf9f6;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#d97706,#b45309);padding:24px 32px;color:white">
+          <div style="font-size:13px;opacity:.9;letter-spacing:.5px">🚨 HUMAN REVIEW REQUESTED · PANALO.AI</div>
+          <h2 style="margin:6px 0 0;font-size:22px;color:white">Visitor wants a human to review their task</h2>
+        </div>
+        <div style="padding:24px 32px;color:#2a2520">
+          <div style="background:#fef3c7;border-left:3px solid #d97706;border-radius:0 8px 8px 0;padding:12px 16px;margin-bottom:20px;font-size:14px">
+            <strong>Action needed:</strong> Reply to ${esc(leadEmail)} within 2 hours to confirm their request and discuss next steps.
+          </div>
+          <div style="margin-bottom:18px">
+            <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">FROM</div>
+            <div style="font-size:15px"><a href="mailto:${esc(leadEmail)}" style="color:#0f8c7e;text-decoration:none;font-weight:600">${esc(leadEmail)}</a></div>
+          </div>
+          <div style="margin-bottom:18px">
+            <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">ORIGINAL TASK</div>
+            <div style="background:white;border-left:3px solid #0f8c7e;padding:14px 18px;border-radius:0 8px 8px 0;font-size:14px;line-height:1.55;white-space:pre-wrap">${esc(safeTask)}</div>
+          </div>
+          ${aiOutput ? `
+          <div style="margin-bottom:18px">
+            <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">
+              WHAT AI ALREADY ATTEMPTED — ${aiConfidence ?? '?'}% CONFIDENCE
+            </div>
+            <div style="background:#fff;border:1px solid #e2ddd8;border-radius:8px;padding:14px 18px;font-size:13px;line-height:1.55;white-space:pre-wrap;color:#3a3630">${esc(aiOutput)}</div>
+            <div style="font-size:12px;color:#9b948e;margin-top:6px;font-style:italic">The visitor saw this AI response and chose to request a human review instead.</div>
+          </div>
+          ` : ''}
+          ${reason ? `
+          <div style="margin-bottom:18px">
+            <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">VISITOR'S NOTE</div>
+            <div style="background:white;border:1px solid #e2ddd8;border-radius:8px;padding:12px 16px;font-size:14px;color:#3a3630">${esc(reason)}</div>
+          </div>
+          ` : ''}
+          <table style="width:100%;font-size:13px;color:#6b6560;border-collapse:collapse;margin-top:18px">
+            <tr><td style="padding:4px 0;width:130px;color:#9b948e">Escalated at</td><td>${esc(when)} PHT</td></tr>
+            <tr><td style="padding:4px 0;color:#9b948e">Lead ID</td><td style="font-family:monospace;font-size:11px">${esc(leadId)}</td></tr>
+          </table>
+          <div style="margin-top:24px;padding-top:18px;border-top:1px solid #e2ddd8;font-size:13px">
+            <strong>Reply directly</strong> — hitting Reply goes to ${esc(leadEmail)}.
+          </div>
+        </div>
+      </div>`,
+    text:
+      `[HUMAN REVIEW REQUESTED] ${leadEmail}\n\n` +
+      `Task:\n${safeTask}\n\n` +
+      (aiOutput ? `AI attempted (${aiConfidence ?? '?'}% confidence):\n${aiOutput}\n\n` : '') +
+      (reason ? `Visitor's note: ${reason}\n\n` : '') +
+      `Escalated: ${when} PHT\n` +
+      `Lead ID: ${leadId}\n\n` +
+      `ACTION: Reply to ${leadEmail} within 2 hours.`,
   });
 }

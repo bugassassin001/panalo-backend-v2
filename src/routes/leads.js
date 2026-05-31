@@ -3,7 +3,7 @@ import { body, validationResult } from 'express-validator';
 import rateLimit from 'express-rate-limit';
 import { supabase } from '../lib/supabase.js';
 import { asyncHandler } from '../middleware/error.js';
-import { sendLeadNotificationEmail, sendLeadEscalationEmail } from '../lib/email.js';
+import { sendLeadNotificationEmail, sendLeadEscalationEmail, sendVisitorEscalationConfirmation } from '../lib/email.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
@@ -180,6 +180,17 @@ router.post('/escalate', escalateLimiter, [
     logger.error('Escalation email send failed', { lead_id, error: err.message });
     // Lead is already marked escalated in DB — return success to user
   }
+
+  // 4. Send confirmation email to the visitor (non-blocking, best-effort).
+  //    We don't want to block the user's response if this fails.
+  sendVisitorEscalationConfirmation({
+    visitorEmail: lead.email,
+    task: lead.task,
+    leadId: lead.id,
+  }).then(
+    () => logger.info('Visitor confirmation email sent', { lead_id, email: lead.email }),
+    (err) => logger.warn('Visitor confirmation email failed', { lead_id, error: err.message }),
+  );
 
   res.json({
     ok: true,

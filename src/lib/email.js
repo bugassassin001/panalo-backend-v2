@@ -241,3 +241,47 @@ export async function sendLeadEscalationEmail({
       `ACTION: Reply to ${leadEmail} within 2 hours.`,
   });
 }
+
+/**
+ * Visitor escalation confirmation — short acknowledgment sent TO the visitor
+ * after they click "Request Human Review". Keeps it brief: confirms receipt,
+ * sets expectation, lets them reply if they want to add context.
+ */
+export async function sendVisitorEscalationConfirmation({ visitorEmail, task, leadId }) {
+  const safeTask = String(task || '').slice(0, 2000);
+  const preview  = safeTask.length > 60 ? safeTask.slice(0, 60) + '…' : safeTask;
+  const replyTo  = process.env.LEADS_TO_EMAIL || 'hello@panalo.ai';
+
+  return sendEmail({
+    to:      visitorEmail,
+    replyTo,                                    // replies go to the team, not back to themselves
+    subject: 'We got your task — a human is on it',
+    html: `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:520px;margin:0 auto;background:#faf9f6;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#0f8c7e,#1a1a26);padding:24px 28px;color:white">
+          <div style="font-size:13px;opacity:.85;letter-spacing:.5px">PANALO.AI</div>
+          <h2 style="margin:6px 0 0;font-size:22px;color:white">We've got it from here 🤝</h2>
+        </div>
+        <div style="padding:24px 28px;color:#2a2520;font-size:15px;line-height:1.6">
+          <p style="margin:0 0 14px">Hi there,</p>
+          <p style="margin:0 0 14px">Thanks for sending this our way — a member of our Philippine team will be in touch within <strong>2 hours</strong> to help you complete it.</p>
+          <div style="background:white;border-left:3px solid #0f8c7e;padding:12px 16px;border-radius:0 8px 8px 0;margin:18px 0;font-size:14px;color:#3a3630">
+            <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">YOUR TASK</div>
+            ${esc(preview)}
+          </div>
+          <p style="margin:0 0 14px;font-size:14px;color:#6b6560">
+            If you have anything to add — context, urgency, files — just reply to this email and it'll go straight to our team.
+          </p>
+          <p style="margin:18px 0 0;font-size:13px;color:#9b948e">
+            — The Panalo.ai team
+          </p>
+        </div>
+      </div>`,
+    text:
+      `Hi there,\n\n` +
+      `Thanks for sending this our way — a member of our Philippine team will be in touch within 2 hours.\n\n` +
+      `Your task:\n${preview}\n\n` +
+      `If you have anything to add, just reply to this email and it'll go to our team.\n\n` +
+      `— The Panalo.ai team`,
+  });
+}

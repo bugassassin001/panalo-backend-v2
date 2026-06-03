@@ -14,7 +14,10 @@ const router = Router();
 
 // ── POST /api/auth/register ──────────────────────────────────────────────────
 router.post('/register', [
-  body('email').isEmail().normalizeEmail(),
+  // Validate format, lowercase + trim, but do NOT strip Gmail dots —
+  // preserve the email as typed so it matches the leads table format.
+  body('email').isEmail()
+    .customSanitizer((v) => String(v || '').trim().toLowerCase()),
   body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters'),
   body('first_name').notEmpty().trim(),
   body('last_name').notEmpty().trim(),
@@ -89,7 +92,8 @@ router.post('/register', [
 
 // ── POST /api/auth/login ─────────────────────────────────────────────────────
 router.post('/login', [
-  body('email').isEmail().normalizeEmail(),
+  body('email').isEmail()
+    .customSanitizer((v) => String(v || '').trim().toLowerCase()),
   body('password').notEmpty(),
   body('expected_role').optional().isIn(['client','agent','admin']),
 ], asyncHandler(async (req, res) => {
@@ -100,11 +104,27 @@ router.post('/login', [
 
   const { email, password, expected_role } = req.body;
 
-  const { data: user } = await supabase
+  // Try exact match first
+  let { data: user } = await supabase
     .from('users')
     .select('*')
     .eq('email', email)
     .single();
+
+  // Fallback: dot-insensitive match for Gmail. If the user typed
+  // 'j.smith@gmail.com' but the stored row is 'jsmith@gmail.com' (or vice
+  // versa from older accounts), this still finds them.
+  if (!user && email.toLowerCase().endsWith('@gmail.com')) {
+    const localPart = email.split('@')[0].replace(/\./g, '').toLowerCase();
+    const { data: candidates } = await supabase
+      .from('users')
+      .select('*')
+      .ilike('email', '%@gmail.com');
+    user = (candidates || []).find(u => {
+      const local = (u.email || '').split('@')[0].replace(/\./g, '').toLowerCase();
+      return local === localPart;
+    }) || null;
+  }
 
   if (!user) {
     return res.status(401).json({ error: 'Invalid email or password' });
@@ -311,7 +331,8 @@ router.get('/me', requireAuth, asyncHandler(async (req, res) => {
 
 // ── POST /api/auth/forgot-password ──────────────────────────────────────────
 router.post('/forgot-password', [
-  body('email').isEmail().normalizeEmail(),
+  body('email').isEmail()
+    .customSanitizer((v) => String(v || '').trim().toLowerCase()),
 ], asyncHandler(async (req, res) => {
   const { email } = req.body;
   const { data: user } = await supabase.from('users').select('*').eq('email', email).single();

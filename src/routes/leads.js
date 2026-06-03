@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { body, validationResult } from 'express-validator';
 import rateLimit from 'express-rate-limit';
+import { randomUUID } from 'node:crypto';
 import { supabase } from '../lib/supabase.js';
 import { asyncHandler } from '../middleware/error.js';
 import { sendLeadNotificationEmail, sendLeadEscalationEmail, sendVisitorEscalationConfirmation } from '../lib/email.js';
@@ -149,13 +150,20 @@ router.post('/escalate', escalateLimiter, [
     return res.status(404).json({ error: 'Lead not found' });
   }
 
-  // 2. Update the lead status to escalated
+  // 2. Generate a signup token so the "Track your task" link in the email
+  //    can identify the lead even before the visitor signs up.
+  //    Token is a single-use, time-limited random string.
+  const signupToken = randomUUID().replace(/-/g, '');
+  const signupTokenExpires = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(); // 14 days
+
   const { error: updateErr } = await supabase
     .from('leads')
     .update({
       status: 'escalated',
       escalated_at: new Date().toISOString(),
       escalation_reason: reason || null,
+      signup_token: signupToken,
+      signup_token_expires: signupTokenExpires,
     })
     .eq('id', lead_id);
 
@@ -182,11 +190,13 @@ router.post('/escalate', escalateLimiter, [
   }
 
   // 4. Send confirmation email to the visitor (non-blocking, best-effort).
-  //    We don't want to block the user's response if this fails.
+  //    Include the signup token so they can click "Track this task" and
+  //    have their email pre-filled at signup.
   sendVisitorEscalationConfirmation({
     visitorEmail: lead.email,
     task: lead.task,
     leadId: lead.id,
+    signupToken,
   }).then(
     () => logger.info('Visitor confirmation email sent', { lead_id, email: lead.email }),
     (err) => logger.warn('Visitor confirmation email failed', { lead_id, error: err.message }),
@@ -195,7 +205,37 @@ router.post('/escalate', escalateLimiter, [
   res.json({
     ok: true,
     message: 'Escalated to our team — you\'ll hear back within 2 hours.',
+    signup_token: signupToken,   // frontend uses this to build the "Track your task" link
   });
+}));
+
+// ── GET /api/leads/by-token/:token ──────────────────────────────────────────
+// Used by the signup page when the visitor arrives via the "Track this task"
+// email link. Returns the email associated with the token so the form can
+// pre-fill it. The token is single-use and time-limited.
+router.get('/by-token/:token', asyncHandler(async (req, res) => {
+  const { token } = req.params;
+  if (!token || token.length < 16) {
+    return res.status(400).json({ error: 'Invalid token' });
+  }
+
+  const { data: lead, error } = await supabase
+    .from('leads')
+    .select('email, signup_token_expires, converted_user_id')
+    .eq('signup_token', token)
+    .single();
+
+  if (error || !lead) {
+    return res.status(404).json({ error: 'Token not found or expired' });
+  }
+  if (lead.converted_user_id) {
+    return res.status(410).json({ error: 'This task has already been linked to an account. Please sign in.' });
+  }
+  if (lead.signup_token_expires && new Date(lead.signup_token_expires) < new Date()) {
+    return res.status(410).json({ error: 'This sign-up link has expired. Please sign up normally with your email.' });
+  }
+
+  res.json({ email: lead.email });
 }));
 
 export default router;

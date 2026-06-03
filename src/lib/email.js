@@ -244,17 +244,39 @@ export async function sendLeadEscalationEmail({
 
 /**
  * Visitor escalation confirmation — short acknowledgment sent TO the visitor
- * after they click "Request Human Review". Keeps it brief: confirms receipt,
- * sets expectation, lets them reply if they want to add context.
+ * after they click "Request Human Review". Now also includes a prominent
+ * "Track this task" CTA so they can convert to a registered user with one click.
  */
-export async function sendVisitorEscalationConfirmation({ visitorEmail, task, leadId }) {
+export async function sendVisitorEscalationConfirmation({ visitorEmail, task, leadId, signupToken }) {
   const safeTask = String(task || '').slice(0, 2000);
   const preview  = safeTask.length > 60 ? safeTask.slice(0, 60) + '…' : safeTask;
   const replyTo  = process.env.LEADS_TO_EMAIL || 'hello@panalo.ai';
 
+  // Build the "Track this task" link. Frontend URL + signup page + token + prefilled email.
+  // The frontend reads ?signup_token=... and ?email=... to pre-fill the signup form.
+  const baseUrl = (process.env.FRONTEND_URL || 'https://www.panalo.ai').split(',')[0].trim();
+  const trackUrl = signupToken
+    ? `${baseUrl}/index.html?signup_token=${encodeURIComponent(signupToken)}&email=${encodeURIComponent(visitorEmail)}&from=escalation#signup`
+    : null;
+
+  const trackButtonHtml = trackUrl ? `
+    <div style="text-align:center;margin:24px 0 8px">
+      <a href="${trackUrl}" style="display:inline-block;background:#0f8c7e;color:white;padding:13px 28px;border-radius:10px;text-decoration:none;font-weight:600;font-size:14px;letter-spacing:.2px">
+        📊 Track this task →
+      </a>
+    </div>
+    <p style="font-size:12px;color:#9b948e;text-align:center;margin:8px 0 0">
+      Create a free account to follow progress, message your agent, and submit more tasks.
+    </p>
+  ` : '';
+
+  const trackTextLine = trackUrl
+    ? `\nWant to follow this task's progress? Track it here: ${trackUrl}\n`
+    : '';
+
   return sendEmail({
     to:      visitorEmail,
-    replyTo,                                    // replies go to the team, not back to themselves
+    replyTo,
     subject: 'We got your task — a human is on it',
     html: `
       <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:520px;margin:0 auto;background:#faf9f6;border-radius:12px;overflow:hidden">
@@ -269,8 +291,9 @@ export async function sendVisitorEscalationConfirmation({ visitorEmail, task, le
             <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">YOUR TASK</div>
             ${esc(preview)}
           </div>
-          <p style="margin:0 0 14px;font-size:14px;color:#6b6560">
-            If you have anything to add — context, urgency, files — just reply to this email and it'll go straight to our team.
+          ${trackButtonHtml}
+          <p style="margin:18px 0 14px;font-size:14px;color:#6b6560">
+            Or just reply to this email if you need to add anything — your reply goes straight to our team.
           </p>
           <p style="margin:18px 0 0;font-size:13px;color:#9b948e">
             — The Panalo.ai team
@@ -280,8 +303,8 @@ export async function sendVisitorEscalationConfirmation({ visitorEmail, task, le
     text:
       `Hi there,\n\n` +
       `Thanks for sending this our way — a member of our Philippine team will be in touch within 2 hours.\n\n` +
-      `Your task:\n${preview}\n\n` +
-      `If you have anything to add, just reply to this email and it'll go to our team.\n\n` +
+      `Your task:\n${preview}\n${trackTextLine}` +
+      `\nOr just reply to this email if you need to add anything.\n\n` +
       `— The Panalo.ai team`,
   });
 }

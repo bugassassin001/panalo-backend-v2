@@ -20,6 +20,7 @@ router.post('/register', [
   body('last_name').notEmpty().trim(),
   body('company').optional().trim(),
   body('plan').optional().isIn(['starter','pro','enterprise']),
+  body('signup_token').optional().isString().isLength({ min: 16, max: 64 }),
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -60,16 +61,28 @@ router.post('/register', [
     return res.status(500).json({ error: 'Registration failed. Please try again.' });
   }
 
+  // Convert any existing leads (escalated or not) into real tasks on the new
+  // user's dashboard. Matches by email AND optionally by signup_token if
+  // provided (more specific). Non-blocking — registration succeeds either way.
+  const convertedTasks = await convertLeadsToTasks(user, req.body.signup_token).catch(err => {
+    logger.warn('Lead-to-task conversion failed', { userId: user.id, error: err.message });
+    return [];
+  });
+
   const tokens = generateTokens(user);
 
   // Send welcome email (non-blocking)
   sendWelcomeEmail(user).catch(err => logger.warn('Welcome email failed', { error: err.message }));
 
-  logger.info('User registered', { userId: user.id, email, plan });
+  logger.info('User registered', {
+    userId: user.id, email, plan,
+    convertedTasks: convertedTasks.length,
+  });
 
   res.status(201).json({
     message: 'Account created successfully',
     user: sanitizeUser(user),
+    converted_tasks: convertedTasks.length,
     ...tokens,
   });
 }));
@@ -215,6 +228,13 @@ router.post('/google', [
     }
     user = created;
     sendWelcomeEmail(user).catch(err => logger.warn('Welcome email failed', { error: err.message }));
+
+    // Convert any pending leads matching this email into tasks
+    convertLeadsToTasks(user).then(
+      (converted) => logger.info('Google signup: converted leads', { userId: user.id, count: converted.length }),
+      (err) => logger.warn('Google signup lead conversion failed', { userId: user.id, error: err.message }),
+    );
+
     logger.info('User registered via Google', { userId: user.id, email });
   } else {
     // Block agents and admins from signing in via Google (which would create a
@@ -340,6 +360,98 @@ router.post('/reset-password', [
 
   res.json({ message: 'Password reset successfully' });
 }));
+
+/**
+ * Convert any matching leads into real tasks on a newly registered user's dashboard.
+ *
+ * Match rules:
+ *   1. If signupToken is provided, find that specific lead (most precise)
+ *   2. Also find all OTHER leads matching the user's email AND status='escalated'
+ *      AND not already converted
+ *
+ * For each matched lead:
+ *   - Create a corresponding row in `tasks` (handler='human', status='review')
+ *   - Update the lead row: status='converted', converted_user_id, converted_at
+ *
+ * Returns array of created task objects (or empty array on no-op / error).
+ */
+async function convertLeadsToTasks(user, signupToken) {
+  if (!user || !user.id || !user.email) return [];
+
+  // Build the query: signup_token match OR (email match AND escalated AND not converted)
+  let leads = [];
+
+  if (signupToken) {
+    const { data: tokenLead } = await supabase
+      .from('leads')
+      .select('*')
+      .eq('signup_token', signupToken)
+      .is('converted_user_id', null)
+      .maybeSingle();
+    if (tokenLead) leads.push(tokenLead);
+  }
+
+  // Also pick up any other escalated leads matching this email (might be multiple)
+  const { data: emailLeads } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('email', user.email)
+    .eq('status', 'escalated')
+    .is('converted_user_id', null);
+
+  if (Array.isArray(emailLeads)) {
+    for (const l of emailLeads) {
+      if (!leads.find(existing => existing.id === l.id)) leads.push(l);
+    }
+  }
+
+  if (leads.length === 0) return [];
+
+  const createdTasks = [];
+  for (const lead of leads) {
+    // 1. Create the task
+    const taskTitle = (lead.task || 'Submitted task').slice(0, 200);
+    const { data: task, error: insErr } = await supabase
+      .from('tasks')
+      .insert({
+        client_id:           user.id,
+        title:               taskTitle,
+        description:         lead.task,
+        type:                'general',
+        priority:            'normal',
+        status:              'review',          // human is already on it
+        handler:             'human',
+        ai_output:           lead.ai_output || null,
+        ai_confidence:       lead.ai_confidence || null,
+        lead_id:             lead.id,
+        original_lead_email: lead.email,
+        created_at:          lead.created_at || new Date().toISOString(),
+      })
+      .select()
+      .single();
+
+    if (insErr) {
+      logger.error('Lead-to-task: insert task failed', { leadId: lead.id, error: insErr.message });
+      continue;
+    }
+
+    // 2. Mark the lead as converted
+    await supabase
+      .from('leads')
+      .update({
+        status: 'converted',
+        converted_user_id: user.id,
+        converted_at: new Date().toISOString(),
+        signup_token: null,         // invalidate token (single use)
+        signup_token_expires: null,
+      })
+      .eq('id', lead.id);
+
+    createdTasks.push(task);
+  }
+
+  return createdTasks;
+}
 
 function sanitizeUser(user) {
   const { password_hash, token_version, ...safe } = user;

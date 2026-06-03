@@ -308,3 +308,78 @@ export async function sendVisitorEscalationConfirmation({ visitorEmail, task, le
       `— The Panalo.ai team`,
   });
 }
+
+/**
+ * Visitor accept-result confirmation — sent when a visitor clicks "Accept Result"
+ * on the AI preview. Confirms the result was saved and offers signup so they can
+ * keep it on their dashboard.
+ */
+export async function sendVisitorAcceptConfirmation({ visitorEmail, task, aiOutput, aiConfidence, leadId, signupToken }) {
+  const safeTask = String(task || '').slice(0, 2000);
+  const preview  = safeTask.length > 60 ? safeTask.slice(0, 60) + '…' : safeTask;
+  const safeAi   = String(aiOutput || '').slice(0, 800);
+  const aiSnippet = safeAi.length > 400 ? safeAi.slice(0, 400) + '…' : safeAi;
+  const replyTo  = process.env.LEADS_TO_EMAIL || 'hello@panalo.ai';
+
+  const baseUrl = (process.env.FRONTEND_URL || 'https://www.panalo.ai').split(',')[0].trim();
+  const trackUrl = signupToken
+    ? `${baseUrl}/index.html?signup_token=${encodeURIComponent(signupToken)}&email=${encodeURIComponent(visitorEmail)}&from=accept#signup`
+    : null;
+
+  const ctaHtml = trackUrl ? `
+    <div style="text-align:center;margin:24px 0 8px">
+      <a href="${trackUrl}" style="display:inline-block;background:#0f8c7e;color:white;padding:13px 28px;border-radius:10px;text-decoration:none;font-weight:600;font-size:14px;letter-spacing:.2px">
+        💾 Save to your dashboard →
+      </a>
+    </div>
+    <p style="font-size:12px;color:#9b948e;text-align:center;margin:8px 0 0">
+      Create a free account to keep this result and easily revisit it later.
+    </p>
+  ` : '';
+
+  const ctaText = trackUrl
+    ? `\nSave this to your dashboard (free account): ${trackUrl}\n`
+    : '';
+
+  return sendEmail({
+    to:      visitorEmail,
+    replyTo,
+    subject: 'Your AI result is ready ⚡',
+    html: `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:560px;margin:0 auto;background:#faf9f6;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#0f8c7e,#1a1a26);padding:24px 28px;color:white">
+          <div style="font-size:13px;opacity:.85;letter-spacing:.5px">PANALO.AI</div>
+          <h2 style="margin:6px 0 0;font-size:22px;color:white">Here's a copy for your records ⚡</h2>
+        </div>
+        <div style="padding:24px 28px;color:#2a2520;font-size:15px;line-height:1.6">
+          <p style="margin:0 0 14px">Hi there,</p>
+          <p style="margin:0 0 14px">Thanks for trying Panalo AI! Here's the result of what you asked us to do.</p>
+          <div style="background:white;border-left:3px solid #0f8c7e;padding:12px 16px;border-radius:0 8px 8px 0;margin:18px 0;font-size:14px;color:#3a3630">
+            <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:4px">YOUR TASK</div>
+            ${esc(preview)}
+          </div>
+          ${aiSnippet ? `
+          <div style="background:#fff;border:1px solid #e2ddd8;border-radius:8px;padding:14px 18px;margin:14px 0;font-size:13px;line-height:1.55;white-space:pre-wrap;color:#3a3630">
+            <div style="font-size:11px;color:#9b948e;text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:6px">AI RESULT ${aiConfidence ? `— ${aiConfidence}% CONFIDENCE` : ''}</div>
+            ${esc(aiSnippet)}
+          </div>
+          ` : ''}
+          ${ctaHtml}
+          <p style="margin:18px 0 14px;font-size:14px;color:#6b6560">
+            Need a human to take a closer look? Just reply to this email — we're here.
+          </p>
+          <p style="margin:18px 0 0;font-size:13px;color:#9b948e">
+            — The Panalo.ai team
+          </p>
+        </div>
+      </div>`,
+    text:
+      `Hi there,\n\n` +
+      `Here's the result of what you asked Panalo AI to do.\n\n` +
+      `Your task:\n${preview}\n\n` +
+      (aiSnippet ? `AI result${aiConfidence ? ` (${aiConfidence}% confidence)` : ''}:\n${aiSnippet}\n` : '') +
+      `${ctaText}\n` +
+      `Need a human's eyes? Just reply to this email.\n\n` +
+      `— The Panalo.ai team`,
+  });
+}

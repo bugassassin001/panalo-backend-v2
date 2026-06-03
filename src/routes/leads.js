@@ -2,12 +2,74 @@ import { Router } from 'express';
 import { body, validationResult } from 'express-validator';
 import rateLimit from 'express-rate-limit';
 import { randomUUID } from 'node:crypto';
+import jwt from 'jsonwebtoken';
 import { supabase } from '../lib/supabase.js';
 import { asyncHandler } from '../middleware/error.js';
-import { sendLeadNotificationEmail, sendLeadEscalationEmail, sendVisitorEscalationConfirmation } from '../lib/email.js';
+import { sendLeadNotificationEmail, sendLeadEscalationEmail, sendVisitorEscalationConfirmation, sendVisitorAcceptConfirmation } from '../lib/email.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
+
+// ── Optional auth middleware ────────────────────────────────────────────────
+// Unlike requireAuth, this NEVER rejects. If a valid Bearer token is present,
+// it populates req.user. If absent/invalid, req.user is left undefined and
+// the request proceeds as a guest.
+function optionalAuth(req, _res, next) {
+  const header = req.get('authorization') || '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) return next();
+  try {
+    const payload = jwt.verify(match[1], process.env.JWT_SECRET);
+    if (payload && payload.id) {
+      req.user = { id: payload.id, email: payload.email, role: payload.role, version: payload.version };
+    }
+  } catch (_e) {
+    // ignore — proceed as guest
+  }
+  next();
+}
+
+// ── Helper: create a task immediately from a logged-in user's lead ──────────
+async function materializeTaskFromLead({ user, lead, status, handler }) {
+  if (!user || !lead) return null;
+  const taskTitle = (lead.task || 'Submitted task').slice(0, 200);
+  const { data: task, error: insErr } = await supabase
+    .from('tasks')
+    .insert({
+      client_id: user.id,
+      title: taskTitle,
+      description: lead.task,
+      type: 'general',
+      priority: 'normal',
+      status,
+      handler,
+      ai_output: lead.ai_output || null,
+      ai_confidence: lead.ai_confidence || null,
+      lead_id: lead.id,
+      original_lead_email: lead.email,
+      created_at: lead.created_at || new Date().toISOString(),
+    })
+    .select()
+    .single();
+
+  if (insErr) {
+    logger.error('Materialize task failed', { leadId: lead.id, error: insErr.message });
+    return null;
+  }
+
+  // Mark the lead as converted (already attached to this user)
+  await supabase.from('leads')
+    .update({
+      status: 'converted',
+      converted_user_id: user.id,
+      converted_at: new Date().toISOString(),
+      signup_token: null,
+      signup_token_expires: null,
+    })
+    .eq('id', lead.id);
+
+  return task;
+}
 
 // ── Stricter rate limit just for leads (5 submissions per IP per hour) ──────
 const leadsLimiter = rateLimit({
@@ -127,7 +189,9 @@ router.post('/submit', leadsLimiter, [
 // Called when a visitor clicks "Request Human Review" after the AI preview.
 // We update the existing lead row (created by /api/ai/preview), then send
 // an escalation email to the team with the original task + AI output for context.
-router.post('/escalate', escalateLimiter, [
+// If the requester is logged in, we ALSO materialize the task on their dashboard
+// immediately (no signup needed).
+router.post('/escalate', optionalAuth, escalateLimiter, [
   body('lead_id').isUUID().withMessage('lead_id required'),
   body('reason').optional().isString().trim().isLength({ max: 500 }),
 ], asyncHandler(async (req, res) => {
@@ -150,26 +214,39 @@ router.post('/escalate', escalateLimiter, [
     return res.status(404).json({ error: 'Lead not found' });
   }
 
-  // 2. Generate a signup token so the "Track your task" link in the email
-  //    can identify the lead even before the visitor signs up.
-  //    Token is a single-use, time-limited random string.
+  // 2. Generate a signup token (only useful for guests, but harmless to set always)
   const signupToken = randomUUID().replace(/-/g, '');
-  const signupTokenExpires = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(); // 14 days
+  const signupTokenExpires = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
+
+  const updates = {
+    status: 'escalated',
+    escalated_at: new Date().toISOString(),
+    escalation_reason: reason || null,
+    signup_token: signupToken,
+    signup_token_expires: signupTokenExpires,
+  };
+  if (req.user?.id) updates.client_id = req.user.id;
 
   const { error: updateErr } = await supabase
     .from('leads')
-    .update({
-      status: 'escalated',
-      escalated_at: new Date().toISOString(),
-      escalation_reason: reason || null,
-      signup_token: signupToken,
-      signup_token_expires: signupTokenExpires,
-    })
+    .update(updates)
     .eq('id', lead_id);
 
   if (updateErr) {
     logger.error('Escalate: status update failed', { lead_id, error: updateErr.message });
-    // Continue anyway — we still want to send the email
+    // Continue — we still want to send the email
+  }
+
+  // 3. If the visitor is logged in, materialize the task on their dashboard now
+  let materializedTask = null;
+  if (req.user?.id) {
+    const updatedLead = { ...lead, ...updates };
+    materializedTask = await materializeTaskFromLead({
+      user: req.user,
+      lead: updatedLead,
+      status: 'review',
+      handler: 'human',
+    });
   }
 
   // 3. Send escalation email to the team with full context
@@ -189,23 +266,113 @@ router.post('/escalate', escalateLimiter, [
     // Lead is already marked escalated in DB — return success to user
   }
 
-  // 4. Send confirmation email to the visitor (non-blocking, best-effort).
-  //    Include the signup token so they can click "Track this task" and
-  //    have their email pre-filled at signup.
-  sendVisitorEscalationConfirmation({
-    visitorEmail: lead.email,
-    task: lead.task,
-    leadId: lead.id,
-    signupToken,
-  }).then(
-    () => logger.info('Visitor confirmation email sent', { lead_id, email: lead.email }),
-    (err) => logger.warn('Visitor confirmation email failed', { lead_id, error: err.message }),
-  );
+  // 4. Send confirmation email to the visitor — but ONLY for guests.
+  //    Logged-in users will see the task on their dashboard immediately,
+  //    so the "Track this task" email is redundant for them.
+  if (!req.user?.id) {
+    sendVisitorEscalationConfirmation({
+      visitorEmail: lead.email,
+      task: lead.task,
+      leadId: lead.id,
+      signupToken,
+    }).then(
+      () => logger.info('Visitor confirmation email sent', { lead_id, email: lead.email }),
+      (err) => logger.warn('Visitor confirmation email failed', { lead_id, error: err.message }),
+    );
+  }
 
   res.json({
     ok: true,
-    message: 'Escalated to our team — you\'ll hear back within 2 hours.',
-    signup_token: signupToken,   // frontend uses this to build the "Track your task" link
+    message: req.user?.id
+      ? 'Escalated — view it on your dashboard.'
+      : 'Escalated to our team — you\'ll hear back within 2 hours.',
+    signup_token: req.user?.id ? null : signupToken,
+    task_id: materializedTask?.id || null,
+    user_signed_in: !!req.user?.id,
+  });
+}));
+
+// ── POST /api/leads/accept ──────────────────────────────────────────────────
+// Called when a visitor clicks "Accept Result" after the AI preview.
+// Marks the lead as ai_completed. For guests, generates a signup token + sends
+// a confirmation email so they can save the result to their account later.
+// For logged-in users, materializes a task with status='completed' immediately.
+router.post('/accept', optionalAuth, escalateLimiter, [
+  body('lead_id').isUUID().withMessage('lead_id required'),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: errors.array()[0]?.msg || 'Invalid input' });
+  }
+
+  const { lead_id } = req.body;
+
+  const { data: lead, error: fetchErr } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('id', lead_id)
+    .single();
+
+  if (fetchErr || !lead) {
+    logger.warn('Accept: lead not found', { lead_id, error: fetchErr?.message });
+    return res.status(404).json({ error: 'Lead not found' });
+  }
+
+  const signupToken = randomUUID().replace(/-/g, '');
+  const signupTokenExpires = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
+
+  const updates = {
+    status: 'ai_completed',
+    signup_token: signupToken,
+    signup_token_expires: signupTokenExpires,
+  };
+  if (req.user?.id) updates.client_id = req.user.id;
+
+  const { error: updateErr } = await supabase
+    .from('leads')
+    .update(updates)
+    .eq('id', lead_id);
+
+  if (updateErr) {
+    logger.error('Accept: status update failed', { lead_id, error: updateErr.message });
+    // continue — non-fatal
+  }
+
+  // If logged in, materialize the task as 'completed' immediately
+  let materializedTask = null;
+  if (req.user?.id) {
+    const updatedLead = { ...lead, ...updates };
+    materializedTask = await materializeTaskFromLead({
+      user: req.user,
+      lead: updatedLead,
+      status: 'completed',
+      handler: 'ai',
+    });
+  }
+
+  // Send "Save this to your dashboard" email — only for guests
+  if (!req.user?.id) {
+    sendVisitorAcceptConfirmation({
+      visitorEmail: lead.email,
+      task: lead.task,
+      aiOutput: lead.ai_output,
+      aiConfidence: lead.ai_confidence,
+      leadId: lead.id,
+      signupToken,
+    }).then(
+      () => logger.info('Visitor accept confirmation email sent', { lead_id, email: lead.email }),
+      (err) => logger.warn('Visitor accept confirmation email failed', { lead_id, error: err.message }),
+    );
+  }
+
+  res.json({
+    ok: true,
+    message: req.user?.id
+      ? 'Saved to your dashboard.'
+      : 'Result saved. Check your email — create an account to save it permanently.',
+    signup_token: req.user?.id ? null : signupToken,
+    task_id: materializedTask?.id || null,
+    user_signed_in: !!req.user?.id,
   });
 }));
 

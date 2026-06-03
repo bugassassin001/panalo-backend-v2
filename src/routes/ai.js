@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { body, validationResult } from 'express-validator';
 import rateLimit from 'express-rate-limit';
+import jwt from 'jsonwebtoken';
 import Anthropic from '@anthropic-ai/sdk';
 import { supabase } from '../lib/supabase.js';
 import { asyncHandler } from '../middleware/error.js';
@@ -8,6 +9,20 @@ import { sendLeadNotificationEmail } from '../lib/email.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
+
+// Optional auth — populates req.user if token is valid; never rejects
+function optionalAuth(req, _res, next) {
+  const header = req.get('authorization') || '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) return next();
+  try {
+    const payload = jwt.verify(match[1], process.env.JWT_SECRET);
+    if (payload && payload.id) {
+      req.user = { id: payload.id, email: payload.email, role: payload.role, version: payload.version };
+    }
+  } catch (_e) {}
+  next();
+}
 
 // ── Strict rate limit — AI calls cost real money ────────────────────────────
 // 3 previews per IP per 15 min. Tune as needed once you see real usage.
@@ -48,7 +63,7 @@ async function verifyTurnstile(token, remoteip) {
 // ── POST /api/ai/preview ────────────────────────────────────────────────────
 // Public endpoint. Visitor submits a task → we save the lead → call Anthropic
 // → return AI output + confidence + lead_id so the frontend can later escalate.
-router.post('/preview', aiLimiter, [
+router.post('/preview', optionalAuth, aiLimiter, [
   body('email').isEmail().withMessage('Valid email required')
     .isLength({ max: 254 })
     .customSanitizer((v) => String(v || '').trim()),
@@ -81,16 +96,19 @@ router.post('/preview', aiLimiter, [
   // 3. Pre-create the lead row with status='ai_attempted'. We get a lead_id
   //    back which the frontend will send if the user clicks "Request Human Review".
   const userAgent = (req.get('user-agent') || '').slice(0, 500);
+  const leadInsert = {
+    email, task,
+    ip: req.ip,
+    user_agent: userAgent,
+    source: source || 'homepage_hero',
+    page_url: page_url || null,
+    status: 'ai_attempted',
+  };
+  if (req.user?.id) leadInsert.client_id = req.user.id;
+
   const { data: lead, error: insErr } = await supabase
     .from('leads')
-    .insert({
-      email, task,
-      ip: req.ip,
-      user_agent: userAgent,
-      source: source || 'homepage_hero',
-      page_url: page_url || null,
-      status: 'ai_attempted',
-    })
+    .insert(leadInsert)
     .select()
     .single();
 
@@ -155,16 +173,19 @@ Keep responses focused and practical. Under 300 words unless the task requires m
     .eq('id', lead.id)
     .then(() => {}, (e) => logger.warn('Failed to save AI output to lead', { error: e?.message }));
 
-  // 6. Always notify the team a new lead came in (regardless of AI confidence).
-  //    The lead is identified at this point so it's a real prospect.
-  sendLeadNotificationEmail({
-    leadEmail: email, task,
-    ip: req.ip, userAgent,
-    source: source || 'homepage_hero',
-    pageUrl: page_url,
-    aiOutput: text,
-    aiConfidence: confidence,
-  }).catch(err => logger.warn('Lead notification email failed', { error: err.message }));
+  // 6. Notify the team a new lead came in — but only for GUESTS.
+  //    Existing users submitting via the homepage hero aren't new leads;
+  //    they'll be visible to agents via the normal task/agent workflow.
+  if (!req.user?.id) {
+    sendLeadNotificationEmail({
+      leadEmail: email, task,
+      ip: req.ip, userAgent,
+      source: source || 'homepage_hero',
+      pageUrl: page_url,
+      aiOutput: text,
+      aiConfidence: confidence,
+    }).catch(err => logger.warn('Lead notification email failed', { error: err.message }));
+  }
 
   logger.info('AI preview generated', { leadId: lead.id, email, confidence });
 
@@ -173,6 +194,7 @@ Keep responses focused and practical. Under 300 words unless the task requires m
     lead_id: lead.id,
     text,
     confidence,
+    user_signed_in: !!req.user?.id,
   });
 }));
 

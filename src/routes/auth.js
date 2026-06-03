@@ -391,12 +391,13 @@ async function convertLeadsToTasks(user, signupToken) {
     if (tokenLead) leads.push(tokenLead);
   }
 
-  // Also pick up any other escalated leads matching this email (might be multiple)
+  // Also pick up any other unconverted leads matching this email
+  // (both 'escalated' and 'ai_completed' are convertible — different task statuses)
   const { data: emailLeads } = await supabase
     .from('leads')
     .select('*')
     .eq('email', user.email)
-    .eq('status', 'escalated')
+    .in('status', ['escalated', 'ai_completed'])
     .is('converted_user_id', null);
 
   if (Array.isArray(emailLeads)) {
@@ -409,7 +410,13 @@ async function convertLeadsToTasks(user, signupToken) {
 
   const createdTasks = [];
   for (const lead of leads) {
-    // 1. Create the task
+    // Derive the task's status + handler from the lead's status:
+    //   'escalated'    → task status='review',    handler='human'
+    //   'ai_completed' → task status='completed', handler='ai'
+    const isEscalated = lead.status === 'escalated';
+    const taskStatus  = isEscalated ? 'review'   : 'completed';
+    const taskHandler = isEscalated ? 'human'    : 'ai';
+
     const taskTitle = (lead.task || 'Submitted task').slice(0, 200);
     const { data: task, error: insErr } = await supabase
       .from('tasks')
@@ -419,8 +426,8 @@ async function convertLeadsToTasks(user, signupToken) {
         description:         lead.task,
         type:                'general',
         priority:            'normal',
-        status:              'review',          // human is already on it
-        handler:             'human',
+        status:              taskStatus,
+        handler:             taskHandler,
         ai_output:           lead.ai_output || null,
         ai_confidence:       lead.ai_confidence || null,
         lead_id:             lead.id,
@@ -435,7 +442,7 @@ async function convertLeadsToTasks(user, signupToken) {
       continue;
     }
 
-    // 2. Mark the lead as converted
+    // Mark the lead as converted
     await supabase
       .from('leads')
       .update({

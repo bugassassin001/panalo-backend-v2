@@ -64,7 +64,7 @@ async function verifyTurnstile(token, remoteip) {
 // Public endpoint. Visitor submits a task → we save the lead → call Anthropic
 // → return AI output + confidence + lead_id so the frontend can later escalate.
 router.post('/preview', optionalAuth, aiLimiter, [
-  body('email').isEmail().withMessage('Valid email required')
+  body('email').optional({ checkFalsy: true }).isEmail().withMessage('Valid email required')
     .isLength({ max: 254 })
     .customSanitizer((v) => String(v || '').trim()),
   body('task').isString().trim().isLength({ min: 5, max: 2000 }).withMessage('Task must be 5–2000 characters'),
@@ -78,7 +78,21 @@ router.post('/preview', optionalAuth, aiLimiter, [
     return res.status(400).json({ error: errors.array()[0]?.msg || 'Invalid input' });
   }
 
-  const { email, task, website, turnstile_token, source, page_url } = req.body;
+  let { email, task, website, turnstile_token, source, page_url } = req.body;
+
+  // If the user is authenticated, ALWAYS use the email from the DB (the source
+  // of truth). This prevents bugs where the client sends a stale or normalized
+  // email from localStorage and breaks downstream notifications.
+  if (req.user?.id) {
+    const { data: dbUser } = await supabase
+      .from('users').select('email').eq('id', req.user.id).single();
+    if (dbUser?.email) email = dbUser.email;
+  }
+
+  // Guests must still provide an email
+  if (!email) {
+    return res.status(400).json({ error: 'Valid email required' });
+  }
 
   // 1. Honeypot
   if (website && website.trim().length > 0) {

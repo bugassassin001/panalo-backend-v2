@@ -86,11 +86,14 @@ router.post('/preview', optionalAuth, aiLimiter, [
     return res.json({ ok: true, fake: true });
   }
 
-  // 2. Turnstile
-  const turnstile = await verifyTurnstile(turnstile_token, req.ip);
-  if (!turnstile.ok) {
-    logger.warn('AI preview rejected: bot check failed', { email, ip: req.ip, reason: turnstile.reason });
-    return res.status(403).json({ error: 'Verification failed. Please refresh and try again.' });
+  // 2. Turnstile — only required for guests. Logged-in users have already
+  //    cleared our auth wall, no need for bot verification on top of that.
+  if (!req.user?.id) {
+    const turnstile = await verifyTurnstile(turnstile_token, req.ip);
+    if (!turnstile.ok) {
+      logger.warn('AI preview rejected: bot check failed', { email, ip: req.ip, reason: turnstile.reason });
+      return res.status(403).json({ error: 'Verification failed. Please refresh and try again.' });
+    }
   }
 
   // 3. Pre-create the lead row with status='ai_attempted'. We get a lead_id

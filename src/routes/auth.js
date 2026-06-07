@@ -353,7 +353,38 @@ router.post('/forgot-password', [
     logger.warn('Password reset email failed', { error: err.message }));
 }));
 
+// ── GET /api/auth/invite-info/:token ────────────────────────────────────────
+// Used by the set-password page to show the invitee's name and role, plus
+// confirm whether the link is still valid before they fill in a password.
+router.get('/invite-info/:token', asyncHandler(async (req, res) => {
+  const { token } = req.params;
+  if (!token) return res.status(400).json({ error: 'Token required' });
+
+  const { data: rec } = await supabase
+    .from('password_reset_tokens')
+    .select('used, expires_at, users(email, first_name, last_name, role, password_hash)')
+    .eq('token', token)
+    .single();
+
+  if (!rec) return res.status(404).json({ error: 'Invitation not found' });
+  if (rec.used) return res.status(410).json({ error: 'This invite has already been used. Try signing in.' });
+  if (new Date(rec.expires_at) < new Date()) {
+    return res.status(410).json({ error: 'This invite has expired. Ask your admin to resend.' });
+  }
+
+  const u = rec.users || {};
+  res.json({
+    email:      u.email,
+    first_name: u.first_name,
+    last_name:  u.last_name,
+    role:       u.role,
+    is_first_time: !u.password_hash,
+  });
+}));
+
 // ── POST /api/auth/reset-password ───────────────────────────────────────────
+// Used for BOTH normal password resets AND first-time agent/admin password
+// setting (after the invite email). The same token table backs both.
 router.post('/reset-password', [
   body('token').notEmpty(),
   body('password').isLength({ min: 8 }),
@@ -369,15 +400,46 @@ router.post('/reset-password', [
     .single();
 
   if (!resetRecord) {
-    return res.status(400).json({ error: 'Invalid or expired reset token' });
+    return res.status(400).json({ error: 'Invalid or expired link. Ask your admin to resend the invite.' });
   }
 
   const password_hash = await bcrypt.hash(password, 12);
+  const isFirstTimeSetup = !resetRecord.users?.password_hash;
+
+  // Update the user — for first-time setup we also mark email as verified
+  // (the act of clicking the unique link in their email proves ownership).
+  const userUpdate = {
+    password_hash,
+    token_version: (resetRecord.users?.token_version || 0) + 1,
+  };
+  if (isFirstTimeSetup) {
+    userUpdate.email_verified = true;
+  }
 
   await Promise.all([
-    supabase.from('users').update({ password_hash, token_version: 1 }).eq('id', resetRecord.user_id),
+    supabase.from('users').update(userUpdate).eq('id', resetRecord.user_id),
     supabase.from('password_reset_tokens').update({ used: true }).eq('token', token),
   ]);
+
+  // For first-time setup, return an access token so the agent/admin can sign in
+  // directly without a separate login step.
+  if (isFirstTimeSetup) {
+    const { data: freshUser } = await supabase
+      .from('users').select('*').eq('id', resetRecord.user_id).single();
+    if (freshUser) {
+      const tokens = generateTokens(freshUser);
+      logger.info('Invite accepted — account activated', {
+        userId: freshUser.id, email: freshUser.email, role: freshUser.role,
+      });
+      const { password_hash: _ph, token_version: _tv, ...safe } = freshUser;
+      return res.json({
+        message: 'Password set successfully',
+        user: safe,
+        first_time_setup: true,
+        ...tokens,
+      });
+    }
+  }
 
   res.json({ message: 'Password reset successfully' });
 }));

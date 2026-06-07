@@ -11,43 +11,60 @@ router.get('/overview', asyncHandler(async (_req, res) => {
   const today  = new Date(); today.setHours(0,0,0,0);
   const todayIso = today.toISOString();
 
-  const [tasksRes, agentsRes, usersRes] = await Promise.all([
+  const [tasksRes, agentsRes, clientsRes] = await Promise.all([
     supabase.from('tasks').select('status, handler, created_at, completed_at'),
-    supabase.from('agents').select('status, current_tasks'),
+    // Read agents from the users table (role='agent') — consolidated from the old agents table
+    supabase.from('users').select('id, agent_status, agent_current_tasks').eq('role', 'agent'),
     supabase.from('users').select('id, plan, created_at').eq('role', 'client'),
   ]);
 
-  const tasks  = tasksRes.data  || [];
-  const agents = agentsRes.data || [];
-  const users  = usersRes.data  || [];
+  const tasks   = tasksRes.data   || [];
+  const agents  = agentsRes.data  || [];
+  const clients = clientsRes.data || [];
 
-  const todayTasks   = tasks.filter(t => t.created_at >= todayIso);
-  const aiResolved   = tasks.filter(t => t.handler === 'ai' && t.status === 'completed');
-  const humanHandled = tasks.filter(t => t.handler === 'human');
+  const todayTasks    = tasks.filter(t => t.created_at >= todayIso);
+  const aiResolved    = tasks.filter(t => t.handler === 'ai' && t.status === 'completed');
+  const humanHandled  = tasks.filter(t => t.handler === 'human');
+  const totalDone     = tasks.filter(t => t.status === 'completed').length;
 
   res.json({
     overview: {
       tasks_today:      todayTasks.length,
       ai_resolved:      aiResolved.length,
       human_handled:    humanHandled.length,
-      ai_rate:          tasks.length ? Math.round(aiResolved.length / tasks.filter(t => t.status === 'completed').length * 100) : 0,
-      agents_online:    agents.filter(a => a.status === 'online').length,
+      ai_rate:          totalDone ? Math.round(aiResolved.length / totalDone * 100) : 0,
+      agents_online:    agents.filter(a => a.agent_status === 'online').length,
       agents_total:     agents.length,
-      total_clients:    users.length,
+      total_clients:    clients.length,
       active_tasks:     tasks.filter(t => ['pending','processing','assigned'].includes(t.status)).length,
     },
   });
 }));
 
 // ── GET /api/admin/agents ─────────────────────────────────────────────────────
+// Reads from users WHERE role='agent' (the agents table has been dropped).
+// Shape kept similar to the old endpoint so any frontend code that consumed
+// it (agent dropdowns, reassign UI) keeps working.
 router.get('/agents', asyncHandler(async (_req, res) => {
-  const { data: agents, error } = await supabase
-    .from('agents')
-    .select('*')
-    .order('status')
-    .order('name');
+  const { data: users, error } = await supabase
+    .from('users')
+    .select('id, first_name, last_name, email, agent_status, agent_current_tasks, last_login, created_at')
+    .eq('role', 'agent')
+    .order('first_name');
 
   if (error) throw error;
+
+  // Project users → the agent shape the old endpoint returned
+  const agents = (users || []).map(u => ({
+    id:             u.id,
+    name:           `${u.first_name || ''} ${u.last_name || ''}`.trim() || u.email,
+    email:          u.email,
+    status:         u.agent_status || 'offline',
+    current_tasks:  u.agent_current_tasks || 0,
+    last_login:     u.last_login,
+    created_at:     u.created_at,
+  }));
+
   res.json({ agents });
 }));
 

@@ -383,3 +383,94 @@ export async function sendVisitorAcceptConfirmation({ visitorEmail, task, aiOutp
       `— The Panalo.ai team`,
   });
 }
+
+/**
+ * Agent/admin invitation — sent when an admin creates a new team member.
+ * Includes a single-use "Set your password" link with a 7-day expiry.
+ *
+ * Also used as a notification-only template (role='notification_only') to alert
+ * other admins when a new admin is created, so suspicious activity is visible.
+ */
+export async function sendAgentInviteEmail({
+  inviteeEmail, inviteeName, inviterName, role, token, isResend, notificationOf,
+}) {
+  const baseUrl = (process.env.FRONTEND_URL || 'https://www.panalo.ai').split(',')[0].trim();
+
+  // Notification-only mode: alert existing admins of a new admin
+  if (role === 'notification_only' && notificationOf) {
+    return sendEmail({
+      to: inviteeEmail,
+      subject: '🔐 New admin account created on Panalo.ai',
+      html: `
+        <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:520px;margin:0 auto;background:#faf9f6;border-radius:12px;overflow:hidden">
+          <div style="background:linear-gradient(135deg,#b45309,#7c2d12);padding:20px 28px;color:white">
+            <div style="font-size:13px;opacity:.9;letter-spacing:.5px">🔐 SECURITY NOTIFICATION</div>
+            <h2 style="margin:6px 0 0;font-size:18px;color:white">New admin account created</h2>
+          </div>
+          <div style="padding:22px 28px;color:#2a2520;font-size:14px;line-height:1.6">
+            <p style="margin:0 0 12px">A new admin account was just created on Panalo.ai:</p>
+            <div style="background:white;border:1px solid #e2ddd8;border-radius:8px;padding:12px 16px;margin:14px 0;font-size:13px">
+              <div><strong>Name:</strong> ${esc(notificationOf.first_name)} ${esc(notificationOf.last_name)}</div>
+              <div><strong>Email:</strong> ${esc(notificationOf.email)}</div>
+              <div><strong>Created by:</strong> ${esc(inviterName)}</div>
+            </div>
+            <p style="margin:12px 0;font-size:13px;color:#9b948e">
+              If you did NOT expect this — disable the account immediately in Supabase
+              <code>UPDATE users SET role='client' WHERE email='${esc(notificationOf.email)}';</code>
+            </p>
+          </div>
+        </div>`,
+      text:
+        `Security notification — A new admin account was created on Panalo.ai:\n\n` +
+        `Name: ${notificationOf.first_name} ${notificationOf.last_name}\n` +
+        `Email: ${notificationOf.email}\n` +
+        `Created by: ${inviterName}\n\n` +
+        `If you did NOT expect this, disable the account immediately.`,
+    });
+  }
+
+  // Real invite to a new agent or admin
+  const setupUrl = `${baseUrl}/set-password.html?token=${encodeURIComponent(token)}`;
+  const roleLabel = role === 'admin' ? 'Admin' : 'Agent';
+  const intro = isResend
+    ? `Here\'s a fresh invitation link to set your Panalo.ai ${roleLabel} password.`
+    : `${esc(inviterName)} has invited you to join the Panalo.ai team as ${role === 'admin' ? 'an Admin' : 'an Agent'}.`;
+
+  return sendEmail({
+    to: inviteeEmail,
+    subject: isResend
+      ? `Your Panalo.ai invitation (resent)`
+      : `You're invited to join Panalo.ai as ${roleLabel.toLowerCase()}`,
+    html: `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:520px;margin:0 auto;background:#faf9f6;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#0f8c7e,#1a1a26);padding:24px 28px;color:white">
+          <div style="font-size:13px;opacity:.85;letter-spacing:.5px">PANALO.AI</div>
+          <h2 style="margin:6px 0 0;font-size:22px;color:white">Welcome to the team 🤝</h2>
+        </div>
+        <div style="padding:24px 28px;color:#2a2520;font-size:15px;line-height:1.6">
+          <p style="margin:0 0 14px">Hi ${esc(inviteeName)},</p>
+          <p style="margin:0 0 14px">${intro}</p>
+          <p style="margin:0 0 14px">Click the button below to set your password and activate your account:</p>
+          <div style="text-align:center;margin:22px 0 8px">
+            <a href="${setupUrl}" style="display:inline-block;background:#0f8c7e;color:white;padding:13px 28px;border-radius:10px;text-decoration:none;font-weight:600;font-size:14px;letter-spacing:.2px">
+              🔑 Set your password →
+            </a>
+          </div>
+          <p style="font-size:12px;color:#9b948e;text-align:center;margin:8px 0 0">
+            This link expires in 7 days. If it expires, ask your admin to resend.
+          </p>
+          <p style="margin:18px 0 0;font-size:13px;color:#6b6560">
+            Your sign-in email will be: <strong>${esc(inviteeEmail)}</strong>
+          </p>
+          <p style="margin:14px 0 0;font-size:12px;color:#9b948e">
+            If you weren't expecting this email, you can ignore it — no account will be activated.
+          </p>
+        </div>
+      </div>`,
+    text:
+      `Hi ${inviteeName},\n\n${intro}\n\n` +
+      `Set your password and activate your account:\n${setupUrl}\n\n` +
+      `Your sign-in email: ${inviteeEmail}\n\n` +
+      `This link expires in 7 days. If you weren't expecting this email, ignore it.`,
+  });
+}

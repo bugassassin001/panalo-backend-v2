@@ -15,11 +15,20 @@ const router = Router();
 router.get('/', requireAuth, asyncHandler(async (req, res) => {
   const role = req.user.role;
 
-  // For admins and agents, JOIN with users so the frontend has client info inline.
-  // Clients don't need this (they ARE the client).
-  const selectCols = (role === 'admin' || role === 'agent')
-    ? '*, client:users!tasks_client_id_fkey(id, first_name, last_name, email, company), agent:users!tasks_agent_id_fkey(id, first_name, last_name, email)'
-    : '*';
+  // Different joins per role:
+  //  - admin: full JOIN (client + agent info, since they see everyone)
+  //  - agent: full JOIN (client + agent info, to display the client)
+  //  - client: just agent info (they know they ARE the client)
+  let selectCols;
+  if (role === 'admin' || role === 'agent') {
+    selectCols = '*, ' +
+      'client:users!tasks_client_id_fkey(id, first_name, last_name, email, company), ' +
+      'agent:users!tasks_agent_id_fkey(id, first_name, last_name, email)';
+  } else if (role === 'client') {
+    selectCols = '*, agent:users!tasks_agent_id_fkey(id, first_name, last_name, email)';
+  } else {
+    selectCols = '*';
+  }
 
   let query = supabase.from('tasks').select(selectCols).order('created_at', { ascending: false });
 
@@ -35,9 +44,10 @@ router.get('/', requireAuth, asyncHandler(async (req, res) => {
   if (error) {
     logger.error('GET /tasks failed', { userId: req.user.id, role, error: error.message });
     // If the join syntax fails, retry without the join so the view at least loads
-    if (role === 'admin' || role === 'agent') {
+    if (role === 'admin' || role === 'agent' || role === 'client') {
       let fbq = supabase.from('tasks').select('*').order('created_at', { ascending: false });
-      if (role === 'agent') fbq = fbq.eq('agent_id', req.user.id);
+      if (role === 'agent')  fbq = fbq.eq('agent_id',  req.user.id);
+      if (role === 'client') fbq = fbq.eq('client_id', req.user.id);
       const { data: fallback, error: fbErr } = await fbq;
       if (!fbErr) {
         logger.warn('Tasks join failed, returned raw rows', { role, error: error.message });

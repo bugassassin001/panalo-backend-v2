@@ -21,6 +21,7 @@ import agentRoutes     from './routes/agents.js';
 import messageRoutes   from './routes/messages.js';
 import billingRoutes   from './routes/billing.js';
 import adminRoutes     from './routes/admin.js';
+import adminUsersRoutes from './routes/admin-users.js';   // ← NEW (agent/admin invites)
 import webhookRoutes   from './routes/webhooks.js';
 import leadsRoutes     from './routes/leads.js';
 import aiRoutes        from './routes/ai.js';        // ← NEW
@@ -108,6 +109,7 @@ app.use('/api/agents',   agentRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/billing',  billingRoutes);
 app.use('/api/admin',    adminRoutes);
+app.use('/api/admin',    adminUsersRoutes);  // ← NEW (handles /users invite endpoints)
 app.use('/api/webhooks', webhookRoutes);
 app.use('/api/leads',    leadsRoutes);   // ← NEW (or already mounted)
 app.use('/api/ai',       aiRoutes);      // ← NEW

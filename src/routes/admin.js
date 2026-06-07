@@ -36,7 +36,7 @@ router.get('/overview', asyncHandler(async (_req, res) => {
       agents_online:    agents.filter(a => a.agent_status === 'online').length,
       agents_total:     agents.length,
       total_clients:    clients.length,
-      active_tasks:     tasks.filter(t => ['pending','processing','assigned'].includes(t.status)).length,
+      active_tasks:     tasks.filter(t => ['pending','active','review'].includes(t.status)).length,
     },
   });
 }));
@@ -81,15 +81,37 @@ router.get('/clients', asyncHandler(async (_req, res) => {
 }));
 
 // ── PATCH /api/admin/tasks/:id/reassign ───────────────────────────────────────
+// Assign a task to an agent (or unassign by passing agent_id=null).
+// - When assigning: status moves to 'active', handler='human'
+// - When unassigning: status moves back to 'review', handler stays 'human'
 router.patch('/tasks/:id/reassign', asyncHandler(async (req, res) => {
   const { agent_id } = req.body;
-  await supabase.from('tasks').update({
-    agent_id,
-    status:     'assigned',
-    updated_at: new Date().toISOString(),
-  }).eq('id', req.params.id);
 
-  res.json({ message: 'Task reassigned' });
+  // Validate the target agent exists and has role='agent'
+  if (agent_id) {
+    const { data: agent } = await supabase
+      .from('users').select('id, role').eq('id', agent_id).single();
+    if (!agent || agent.role !== 'agent') {
+      return res.status(400).json({ error: 'Invalid agent_id — must reference a user with role=agent' });
+    }
+  }
+
+  const updates = {
+    agent_id: agent_id || null,
+    handler:  'human',
+    status:   agent_id ? 'active' : 'review',
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data, error } = await supabase
+    .from('tasks').update(updates).eq('id', req.params.id)
+    .select().single();
+
+  if (error) {
+    return res.status(500).json({ error: 'Could not reassign task' });
+  }
+
+  res.json({ message: agent_id ? 'Task assigned' : 'Task unassigned', task: data });
 }));
 
 export default router;

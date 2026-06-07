@@ -10,25 +10,43 @@ const router = Router();
 // ── GET /api/tasks ───────────────────────────────────────────────────────────
 // Returns tasks scoped to the caller's role:
 //   - client: their own tasks
-//   - agent:  tasks assigned to them + unclaimed tasks needing human handling
-//   - admin:  all tasks
+//   - agent:  ONLY tasks assigned to them (strict, per design)
+//   - admin:  all tasks, enriched with client info
 router.get('/', requireAuth, asyncHandler(async (req, res) => {
   const role = req.user.role;
-  let query = supabase.from('tasks').select('*').order('created_at', { ascending: false });
+
+  // For admins and agents, JOIN with users so the frontend has client info inline.
+  // Clients don't need this (they ARE the client).
+  const selectCols = (role === 'admin' || role === 'agent')
+    ? '*, client:users!tasks_client_id_fkey(id, first_name, last_name, email, company), agent:users!tasks_agent_id_fkey(id, first_name, last_name, email)'
+    : '*';
+
+  let query = supabase.from('tasks').select(selectCols).order('created_at', { ascending: false });
 
   if (role === 'client') {
     query = query.eq('client_id', req.user.id);
   } else if (role === 'agent') {
-    // Agent's queue = assigned to them OR pending human review
-    query = query.or(`agent_id.eq.${req.user.id},and(handler.eq.human,agent_id.is.null)`);
+    // Strict: agents only see what's assigned to them
+    query = query.eq('agent_id', req.user.id);
   }
   // admin: no filter — sees all
 
   const { data, error } = await query;
   if (error) {
-    logger.error('GET /tasks failed', { userId: req.user.id, error: error.message });
+    logger.error('GET /tasks failed', { userId: req.user.id, role, error: error.message });
+    // If the join syntax fails, retry without the join so the view at least loads
+    if (role === 'admin' || role === 'agent') {
+      let fbq = supabase.from('tasks').select('*').order('created_at', { ascending: false });
+      if (role === 'agent') fbq = fbq.eq('agent_id', req.user.id);
+      const { data: fallback, error: fbErr } = await fbq;
+      if (!fbErr) {
+        logger.warn('Tasks join failed, returned raw rows', { role, error: error.message });
+        return res.json({ tasks: fallback || [] });
+      }
+    }
     return res.status(500).json({ error: 'Could not load tasks' });
   }
+  logger.info('GET /tasks ok', { userId: req.user.id, role, count: (data || []).length });
   res.json({ tasks: data || [] });
 }));
 
@@ -69,7 +87,6 @@ router.post('/', requireAuth, [
 
   // Also bump the user's task_count
   await supabase.rpc('increment_task_count', { user_id: req.user.id }).then(() => {}, () => {
-    // RPC may not exist — fall back to manual update
     return supabase.from('users')
       .update({ task_count: (req.user.task_count || 0) + 1 })
       .eq('id', req.user.id);
@@ -93,7 +110,7 @@ router.get('/:id', requireAuth, asyncHandler(async (req, res) => {
   if (req.user.role === 'client' && data.client_id !== req.user.id) {
     return res.status(403).json({ error: 'Forbidden' });
   }
-  if (req.user.role === 'agent' && data.agent_id !== req.user.id && data.agent_id !== null) {
+  if (req.user.role === 'agent' && data.agent_id !== req.user.id) {
     return res.status(403).json({ error: 'Forbidden' });
   }
 

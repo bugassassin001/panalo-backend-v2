@@ -64,14 +64,68 @@ export async function sendWelcomeEmail(user) {
   });
 }
 
-export async function sendTaskCompletedEmail(user, task, result) {
-  const subject = result.handler === 'ai'
-    ? `⚡ Task completed by AI — ${task.title.slice(0, 50)}`
-    : `✓ Task completed by your agent — ${task.title.slice(0, 50)}`;
+/**
+ * Sent to the client when their task is marked complete.
+ * Supports two call signatures for backwards compatibility:
+ *   sendTaskCompletedEmail(user, task, result)         // legacy
+ *   sendTaskCompletedEmail({ client, task, summary, agentName })  // new
+ */
+export async function sendTaskCompletedEmail(arg1, task2, result) {
+  let client, task, summary = '', agentName = 'Your agent';
+  if (arg1 && typeof arg1 === 'object' && arg1.client) {
+    client    = arg1.client;
+    task      = arg1.task;
+    summary   = arg1.summary || '';
+    agentName = arg1.agentName || 'Your agent';
+  } else {
+    client    = arg1;
+    task      = task2;
+    summary   = (result && typeof result === 'object' && result.summary) || '';
+    agentName = (result && typeof result === 'object' && result.agentName) || 'Your agent';
+  }
+  if (!client || !client.email || !task) return;
+
+  const baseUrl = (process.env.FRONTEND_URL || 'https://www.panalo.ai').split(',')[0].trim();
+  const dashUrl = `${baseUrl}/dashboard.html`;
+
+  const taskTitle = String(task.title || 'Your task').slice(0, 80);
+  const summaryHtml = summary
+    ? `<div style="background:white;border-left:3px solid #0f8c7e;padding:14px 18px;border-radius:0 8px 8px 0;margin:18px 0;font-size:14px;color:#3a3630;line-height:1.6;white-space:pre-wrap">${esc(summary)}</div>`
+    : '';
+
   return sendEmail({
-    to: user.email, subject,
-    html: `<p>${esc(task.title)} — completed.</p>`,
-    text: `Your task "${task.title}" has been completed.`,
+    to: client.email,
+    subject: `✓ Task completed — ${taskTitle}`,
+    html: `
+      <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:560px;margin:0 auto;background:#faf9f6;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#0f8c7e,#1a1a26);padding:24px 28px;color:white">
+          <div style="font-size:13px;opacity:.85;letter-spacing:.5px">PANALO.AI</div>
+          <h2 style="margin:6px 0 0;font-size:22px;color:white">✓ Task completed</h2>
+        </div>
+        <div style="padding:24px 28px;color:#2a2520;font-size:15px;line-height:1.6">
+          <p style="margin:0 0 14px">Hi ${esc(client.first_name || 'there')},</p>
+          <p style="margin:0 0 14px">${esc(agentName)} has just marked your task as complete:</p>
+          <div style="font-size:14px;font-weight:600;margin:14px 0 6px">"${esc(taskTitle)}"</div>
+          ${summaryHtml}
+          <div style="text-align:center;margin:22px 0 8px">
+            <a href="${dashUrl}" style="display:inline-block;background:#0f8c7e;color:white;padding:13px 28px;border-radius:10px;text-decoration:none;font-weight:600;font-size:14px">
+              Open dashboard →
+            </a>
+          </div>
+          <p style="margin:18px 0 0;font-size:13px;color:#6b6560">
+            If anything's not quite right, you can reopen the task from your dashboard or just reply to this email.
+          </p>
+          <p style="margin:14px 0 0;font-size:12px;color:#9b948e">— The Panalo.ai team</p>
+        </div>
+      </div>`,
+    text:
+      `Hi ${client.first_name || 'there'},\n\n` +
+      `${agentName} just marked your task complete:\n\n` +
+      `"${taskTitle}"\n\n` +
+      (summary ? `${summary}\n\n` : '') +
+      `View on your dashboard: ${dashUrl}\n\n` +
+      `If anything's not right, you can reopen the task or reply to this email.\n\n` +
+      `— The Panalo.ai team`,
   });
 }
 

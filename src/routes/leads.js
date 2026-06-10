@@ -4,6 +4,7 @@ import rateLimit from 'express-rate-limit';
 import { randomUUID } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { supabase } from '../lib/supabase.js';
+import { requireAuth } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/error.js';
 import { sendLeadNotificationEmail, sendLeadEscalationEmail, sendVisitorEscalationConfirmation, sendVisitorAcceptConfirmation } from '../lib/email.js';
 import { logger } from '../lib/logger.js';
@@ -403,6 +404,54 @@ router.get('/by-token/:token', asyncHandler(async (req, res) => {
   }
 
   res.json({ email: lead.email });
+}));
+
+// ── POST /api/leads/keep-ai ────────────────────────────────────────────────
+// Logged-in users only. The user has seen the AI's initial response and wants
+// to keep iterating — creates a task with handler='ai' and status='active'.
+// The user can then have a back-and-forth conversation on the AI Output tab,
+// and Accept or Request Human Review at any time from there.
+router.post('/keep-ai', requireAuth, [
+  body('lead_id').isUUID().withMessage('lead_id required'),
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: errors.array()[0]?.msg || 'Invalid input' });
+  }
+
+  const { lead_id } = req.body;
+
+  const { data: lead, error: fetchErr } = await supabase
+    .from('leads').select('*').eq('id', lead_id).single();
+
+  if (fetchErr || !lead) {
+    logger.warn('Keep-ai: lead not found', { lead_id, error: fetchErr?.message });
+    return res.status(404).json({ error: 'Lead not found' });
+  }
+
+  // Stamp the lead as ai_active and attach to the user
+  await supabase.from('leads').update({
+    status: 'ai_active',
+    client_id: req.user.id,
+  }).eq('id', lead_id);
+
+  const materialized = await materializeTaskFromLead({
+    user:    req.user,
+    lead:    { ...lead, client_id: req.user.id },
+    status:  'active',
+    handler: 'ai',
+  });
+
+  if (!materialized) {
+    return res.status(500).json({ error: 'Could not create task' });
+  }
+
+  logger.info('Lead kept as AI-active task', { lead_id, task_id: materialized.id, user_id: req.user.id });
+  res.json({
+    ok: true,
+    task_id: materialized.id,
+    message: 'Task added to your dashboard. Continue chatting with the AI in the AI Output tab.',
+  });
 }));
 
 export default router;

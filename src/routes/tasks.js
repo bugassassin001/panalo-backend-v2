@@ -284,4 +284,58 @@ router.patch('/:id/reopen', requireAuth, asyncHandler(async (req, res) => {
   res.json({ task: updated, message: 'Task reopened' });
 }));
 
+// ── PATCH /api/tasks/:id/escalate-to-human ──────────────────────────────────
+// Client converts an AI-handled task into a human-handled task. Used from
+// the AI conversation when the AI isn't cutting it.
+router.patch('/:id/escalate-to-human', requireAuth, asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { data: task, error: fetchErr } = await supabase
+    .from('tasks').select('*').eq('id', id).single();
+
+  if (fetchErr || !task) return res.status(404).json({ error: 'Task not found' });
+
+  // Only the client who owns the task can escalate (admins can also do it)
+  if (req.user.role === 'client' && task.client_id !== req.user.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  if (task.handler === 'human' && task.status === 'review') {
+    return res.status(409).json({ error: 'This task is already awaiting a human agent.' });
+  }
+
+  const nowIso = new Date().toISOString();
+  const { data: updated, error: updErr } = await supabase
+    .from('tasks').update({
+      handler:    'human',
+      status:     'review',
+      updated_at: nowIso,
+    }).eq('id', id).select().single();
+
+  if (updErr) {
+    logger.error('Escalate-to-human failed', { id, error: updErr.message });
+    return res.status(500).json({ error: 'Could not escalate task' });
+  }
+
+  // Drop a system message in the human-chat thread so the agent has context
+  const { data: me } = await supabase.from('users')
+    .select('first_name, last_name, email').eq('id', req.user.id).single();
+  const whoName = me
+    ? (`${me.first_name || ''} ${me.last_name || ''}`.trim() || me.email)
+    : req.user.email;
+
+  await supabase.from('messages').insert({
+    id:          crypto.randomUUID(),
+    task_id:     id,
+    sender_id:   req.user.id,
+    sender_type: 'system',
+    sender_name: 'System',
+    body:        `${whoName} requested a human agent to take over this task. The AI conversation is preserved on the AI Output tab.`,
+    read_by_client_at: nowIso,
+    read_by_agent_at:  null,
+    created_at:  nowIso,
+  });
+
+  logger.info('Task escalated to human', { taskId: id, by: req.user.id });
+  res.json({ task: updated, message: 'Task escalated to human agent' });
+}));
+
 export default router;

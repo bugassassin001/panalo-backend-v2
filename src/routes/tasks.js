@@ -53,14 +53,75 @@ router.get('/', requireAuth, asyncHandler(async (req, res) => {
       const { data: fallback, error: fbErr } = await fbq;
       if (!fbErr) {
         logger.warn('Tasks join failed, returned raw rows', { role, error: error.message });
-        return res.json({ tasks: fallback || [] });
+        const withUnread = await attachUnreadCounts(fallback || [], role);
+        return res.json({ tasks: withUnread });
       }
     }
     return res.status(500).json({ error: 'Could not load tasks' });
   }
-  logger.info('GET /tasks ok', { userId: req.user.id, role, count: (data || []).length });
-  res.json({ tasks: data || [] });
+
+  // Attach per-task unread message counts based on viewer role
+  const tasksWithUnread = await attachUnreadCounts(data || [], role);
+
+  logger.info('GET /tasks ok', { userId: req.user.id, role, count: tasksWithUnread.length });
+  res.json({ tasks: tasksWithUnread });
 }));
+
+/**
+ * Compute unread message counts per task for the given viewer role and merge
+ * them into the tasks array as `unread_count`.
+ *
+ * Counting rules (mirrors the UX intent):
+ *   - For AGENT viewers: count messages where sender_type='client' AND
+ *     read_by_agent_at IS NULL. System messages and the agent's own messages
+ *     don't count.
+ *   - For CLIENT viewers: count messages where sender_type IN ('agent','admin')
+ *     AND read_by_client_at IS NULL. System and the client's own messages
+ *     don't count.
+ *   - For ADMIN viewers: we don't show unread badges (no per-admin read state),
+ *     so just attach 0 to every task.
+ *
+ * One DB roundtrip total: a single SELECT scoped to the visible task IDs.
+ */
+async function attachUnreadCounts(tasks, role) {
+  if (!tasks.length) return tasks;
+  if (role === 'admin') {
+    // Admin doesn't get unread badges — fast path
+    return tasks.map(t => ({ ...t, unread_count: 0 }));
+  }
+
+  const taskIds = tasks.map(t => t.id).filter(Boolean);
+  if (!taskIds.length) return tasks.map(t => ({ ...t, unread_count: 0 }));
+
+  // Pull only the fields we need to compute the count, then aggregate in JS.
+  // Supabase doesn't expose Postgres GROUP BY in the JS client cleanly, so
+  // this is the simplest correct approach.
+  let q = supabase
+    .from('messages')
+    .select('task_id, sender_type, read_by_agent_at, read_by_client_at')
+    .in('task_id', taskIds);
+
+  // Narrow the SELECT to relevant rows for the role
+  if (role === 'agent') {
+    q = q.eq('sender_type', 'client').is('read_by_agent_at', null);
+  } else if (role === 'client') {
+    q = q.in('sender_type', ['agent', 'admin']).is('read_by_client_at', null);
+  }
+
+  const { data: msgs, error } = await q;
+  if (error) {
+    // Non-fatal — log and return tasks with unread_count=0 so the UI still loads
+    logger.warn('Unread count query failed', { role, error: error.message });
+    return tasks.map(t => ({ ...t, unread_count: 0 }));
+  }
+
+  // Count per task_id
+  const counts = new Map();
+  for (const m of msgs || []) {
+    counts.set(m.task_id, (counts.get(m.task_id) || 0) + 1);
+  }
+  return tasks.map(t => ({ ...t, unread_count: counts.get(t.id) || 0 }));
+}
 
 // ── POST /api/tasks ──────────────────────────────────────────────────────────
 // Create a new task (clients only)

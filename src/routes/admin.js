@@ -177,4 +177,38 @@ router.patch('/tasks/:id/reassign', asyncHandler(async (req, res) => {
   res.json({ message: agent_id ? 'Task assigned' : 'Task unassigned', task: data });
 }));
 
+// ── PATCH /api/admin/tasks/:id/priority ──────────────────────────────────────
+// Admin sets a task's priority. The agent's dashboard polls every few seconds
+// and re-renders, so the change appears in their queue automatically (the
+// Urgent tab in the agent UI filters on this field).
+router.patch('/tasks/:id/priority', asyncHandler(async (req, res) => {
+  const ALLOWED = ['low', 'normal', 'urgent'];
+  const priority = String(req.body?.priority || '').toLowerCase();
+
+  if (!ALLOWED.includes(priority)) {
+    return res.status(400).json({
+      error: `Invalid priority. Must be one of: ${ALLOWED.join(', ')}.`,
+    });
+  }
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .update({
+      priority,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: 'Could not update task priority' });
+  }
+  if (!data) {
+    return res.status(404).json({ error: 'Task not found' });
+  }
+
+  res.json({ message: 'Priority updated', task: data });
+}));
+
 export default router;

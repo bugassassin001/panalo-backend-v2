@@ -69,15 +69,78 @@ router.get('/agents', asyncHandler(async (_req, res) => {
 }));
 
 // ── GET /api/admin/clients ────────────────────────────────────────────────────
+// Lists clients that have submitted at least one task (lifetime). For each
+// client we compute: tasks in last 30 days, AI rate of those tasks, and a
+// derived "status" (active if any task in last 30 days, else inactive).
 router.get('/clients', asyncHandler(async (_req, res) => {
-  const { data: clients, error } = await supabase
+  // 1. All client users — we'll filter to those with tasks below
+  const { data: users, error: usersErr } = await supabase
     .from('users')
     .select('id, first_name, last_name, email, company, plan, created_at, last_login')
-    .eq('role', 'client')
-    .order('created_at', { ascending: false });
+    .eq('role', 'client');
 
-  if (error) throw error;
-  res.json({ clients });
+  if (usersErr) throw usersErr;
+
+  // 2. Pull every task that has a client_id with the fields needed for stats.
+  //    A single query + in-memory aggregation is simpler than multiple per-user
+  //    queries, and tasks volume is small enough at this stage.
+  const { data: tasks, error: tasksErr } = await supabase
+    .from('tasks')
+    .select('client_id, handler, created_at')
+    .not('client_id', 'is', null);
+
+  if (tasksErr) throw tasksErr;
+
+  const now = Date.now();
+  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+  // Aggregate per client
+  const statsByClient = new Map(); // client_id -> { total, recent, aiRecent, lastTaskAt }
+  for (const t of tasks || []) {
+    const created = t.created_at ? new Date(t.created_at).getTime() : 0;
+    const isRecent = created && (now - created) <= THIRTY_DAYS_MS;
+    const s = statsByClient.get(t.client_id) || { total: 0, recent: 0, aiRecent: 0, lastTaskAt: null };
+    s.total += 1;
+    if (isRecent) {
+      s.recent += 1;
+      if (t.handler === 'ai') s.aiRecent += 1;
+    }
+    if (!s.lastTaskAt || created > s.lastTaskAt) s.lastTaskAt = created;
+    statsByClient.set(t.client_id, s);
+  }
+
+  // Build final list — ONLY clients with at least 1 task ever
+  const clientsWithTasks = (users || [])
+    .filter(u => statsByClient.has(u.id))
+    .map(u => {
+      const s = statsByClient.get(u.id);
+      const aiRate = s.recent > 0 ? Math.round((s.aiRecent / s.recent) * 100) : null;
+      const isActive = s.lastTaskAt && (now - s.lastTaskAt) <= THIRTY_DAYS_MS;
+      return {
+        id:           u.id,
+        first_name:   u.first_name || '',
+        last_name:    u.last_name || '',
+        name:         `${u.first_name || ''} ${u.last_name || ''}`.trim() || u.email,
+        email:        u.email,
+        company:      u.company || null,
+        plan:         u.plan || 'starter',
+        tasks_30d:    s.recent,
+        ai_rate_30d:  aiRate,         // null when no recent tasks
+        total_tasks:  s.total,
+        status:       isActive ? 'active' : 'inactive',
+        last_task_at: s.lastTaskAt ? new Date(s.lastTaskAt).toISOString() : null,
+        last_login:   u.last_login,
+        created_at:   u.created_at,
+      };
+    })
+    // Most recently active first
+    .sort((a, b) => {
+      const at = a.last_task_at ? new Date(a.last_task_at).getTime() : 0;
+      const bt = b.last_task_at ? new Date(b.last_task_at).getTime() : 0;
+      return bt - at;
+    });
+
+  res.json({ clients: clientsWithTasks });
 }));
 
 // ── PATCH /api/admin/tasks/:id/reassign ───────────────────────────────────────

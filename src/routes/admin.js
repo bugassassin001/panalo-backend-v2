@@ -8,12 +8,17 @@ router.use(requireAuth, requireRole('admin'));
 
 // ── GET /api/admin/overview ───────────────────────────────────────────────────
 router.get('/overview', asyncHandler(async (_req, res) => {
-  const today  = new Date(); today.setHours(0,0,0,0);
-  const todayIso = today.toISOString();
+  const now = new Date();
+  const startOfToday = new Date(now); startOfToday.setHours(0, 0, 0, 0);
+  const startOfYesterday = new Date(startOfToday.getTime() - 24 * 60 * 60 * 1000);
+  const todayIso     = startOfToday.toISOString();
+  const yesterdayIso = startOfYesterday.toISOString();
 
   const [tasksRes, agentsRes, clientsRes] = await Promise.all([
-    supabase.from('tasks').select('status, handler, created_at, completed_at'),
-    // Read agents from the users table (role='agent') — consolidated from the old agents table
+    // Pull a wider field set so we can compute handle-time and type breakdown.
+    // For a small dataset this is fine; if tasks grows large, we'd add filters.
+    supabase.from('tasks')
+      .select('id, status, handler, type, created_at, updated_at, completed_at, agent_id'),
     supabase.from('users').select('id, agent_status, agent_current_tasks').eq('role', 'agent'),
     supabase.from('users').select('id, plan, created_at').eq('role', 'client'),
   ]);
@@ -22,21 +27,73 @@ router.get('/overview', asyncHandler(async (_req, res) => {
   const agents  = agentsRes.data  || [];
   const clients = clientsRes.data || [];
 
-  const todayTasks    = tasks.filter(t => t.created_at >= todayIso);
-  const aiResolved    = tasks.filter(t => t.handler === 'ai' && t.status === 'completed');
-  const humanHandled  = tasks.filter(t => t.handler === 'human');
-  const totalDone     = tasks.filter(t => t.status === 'completed').length;
+  // ── Today vs yesterday ────────────────────────────────────────────────────
+  const todayTasks     = tasks.filter(t => t.created_at >= todayIso);
+  const yesterdayTasks = tasks.filter(t => t.created_at >= yesterdayIso && t.created_at < todayIso);
+
+  // % change vs yesterday — null when yesterday was zero (can't divide; "—" in UI)
+  const yesterdayCount = yesterdayTasks.length;
+  const todayCount     = todayTasks.length;
+  const taskDeltaPct = yesterdayCount > 0
+    ? Math.round(((todayCount - yesterdayCount) / yesterdayCount) * 100)
+    : null;
+
+  // ── AI vs Human (today's tasks, for the donut + KPI tiles) ───────────────
+  const aiToday    = todayTasks.filter(t => t.handler === 'ai').length;
+  const humanToday = todayTasks.filter(t => t.handler === 'human').length;
+  const aiRateToday = todayCount > 0 ? Math.round((aiToday / todayCount) * 100) : 0;
+
+  // Lifetime AI rate (used in the donut sub-label as context)
+  const aiResolvedAll  = tasks.filter(t => t.handler === 'ai' && t.status === 'completed').length;
+  const totalDoneAll   = tasks.filter(t => t.status === 'completed').length;
+  const aiRateLifetime = totalDoneAll > 0 ? Math.round((aiResolvedAll / totalDoneAll) * 100) : 0;
+
+  // ── Tasks by type (today) ─────────────────────────────────────────────────
+  // Returns object keyed by type → count. Frontend sorts and slices.
+  const byType = {};
+  for (const t of todayTasks) {
+    const key = (t.type || 'other').toLowerCase();
+    byType[key] = (byType[key] || 0) + 1;
+  }
+  // Array form for ordered iteration in the bar chart
+  const tasksByType = Object.entries(byType)
+    .map(([type, count]) => ({ type, count }))
+    .sort((a, b) => b.count - a.count);
+
+  // ── Average handle time (completed today, human-handled) ─────────────────
+  // Measured: completed_at - created_at, in minutes
+  const completedTodayWithTimes = todayTasks.filter(t =>
+    t.status === 'completed' && t.handler === 'human' && t.completed_at && t.created_at
+  );
+  let avgHandleMin = null;
+  if (completedTodayWithTimes.length > 0) {
+    const totalMs = completedTodayWithTimes.reduce((sum, t) => {
+      return sum + (new Date(t.completed_at).getTime() - new Date(t.created_at).getTime());
+    }, 0);
+    avgHandleMin = Math.round(totalMs / completedTodayWithTimes.length / 60000);
+  }
 
   res.json({
     overview: {
-      tasks_today:      todayTasks.length,
-      ai_resolved:      aiResolved.length,
-      human_handled:    humanHandled.length,
-      ai_rate:          totalDone ? Math.round(aiResolved.length / totalDone * 100) : 0,
-      agents_online:    agents.filter(a => a.agent_status === 'online').length,
-      agents_total:     agents.length,
-      total_clients:    clients.length,
-      active_tasks:     tasks.filter(t => ['pending','active','review'].includes(t.status)).length,
+      // KPI tiles
+      tasks_today:        todayCount,
+      tasks_yesterday:    yesterdayCount,
+      task_delta_pct:     taskDeltaPct,            // null when yesterday was 0
+      ai_resolved_today:  aiToday,
+      human_handled_today: humanToday,
+      ai_rate_today:      aiRateToday,             // 0-100
+      ai_rate_lifetime:   aiRateLifetime,          // 0-100
+      agents_online:      agents.filter(a => a.agent_status === 'online').length,
+      agents_total:       agents.length,
+      total_clients:      clients.length,
+      active_tasks:       tasks.filter(t => ['pending','active','review'].includes(t.status)).length,
+      avg_handle_min:     avgHandleMin,            // null when nothing completed today
+      // Chart data
+      tasks_by_type:      tasksByType,             // [{type:'research', count: 12}, ...]
+      // Legacy fields kept for back-compat with any older callers
+      ai_resolved:        aiResolvedAll,
+      human_handled:      tasks.filter(t => t.handler === 'human').length,
+      ai_rate:            aiRateLifetime,
     },
   });
 }));

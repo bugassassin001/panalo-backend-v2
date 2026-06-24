@@ -231,7 +231,7 @@ Keep responses focused and practical. Under 300 words unless the task requires m
 //   • Conversation context capped at MAX_CONTEXT_MESSAGES (cost control)
 // ============================================================
 
-const MAX_AI_TURNS         = 10;   // user messages per task before forcing escalation
+const MAX_AI_TURNS         = 15;   // human messages (client+agent combined) per task before forcing escalation
 const MAX_CONTEXT_MESSAGES = 20;   // keep at most this many msgs in the context window
 const MAX_CONVERSATION_TOKENS_OUT = 800;
 
@@ -245,14 +245,33 @@ const aiChatLimiter = rateLimit({
 });
 
 // Helper: authorize the requester and load the task in one place.
+// Access rules for the AI conversation:
+//   • Client owns the task → allowed (the original behavior)
+//   • Agent is assigned to the task → allowed (so they can read AND chat)
+//   • Admin → allowed (oversight + support)
 async function loadTaskForAIConversation(taskId, user) {
   const { data: task, error } = await supabase
     .from('tasks').select('*').eq('id', taskId).single();
   if (error || !task) return { error: 'Task not found', status: 404 };
+
   if (user.role === 'client' && task.client_id !== user.id) {
     return { error: 'You do not own this task', status: 403 };
   }
+  if (user.role === 'agent' && task.agent_id !== user.id) {
+    return { error: 'This task is not assigned to you', status: 403 };
+  }
+  // Admins can access any task — no extra check
+
   return { task };
+}
+
+/* Map an authenticated user to the role label we store with their AI-thread
+   messages. The DB column accepts 'client' | 'agent' | 'assistant'. Admins
+   posting into a task get tagged as 'agent' for display purposes since the
+   client sees them as a human helper, not a separate role. */
+function senderRoleForUser(user) {
+  if (user.role === 'agent' || user.role === 'admin') return 'agent';
+  return 'client';
 }
 
 // ── GET /api/ai/conversation/:taskId ────────────────────────────────────────
@@ -263,7 +282,7 @@ router.get('/conversation/:taskId', requireAuth, asyncHandler(async (req, res) =
 
   const { data: messages, error } = await supabase
     .from('task_ai_messages')
-    .select('id, role, content, confidence, created_at')
+    .select('id, role, content, confidence, sender_user_id, created_at')
     .eq('task_id', taskId)
     .order('created_at', { ascending: true });
 
@@ -272,25 +291,37 @@ router.get('/conversation/:taskId', requireAuth, asyncHandler(async (req, res) =
     return res.status(500).json({ error: 'Could not load AI conversation' });
   }
 
+  /* Normalize the legacy 'user' role to 'client' for any old rows that haven't
+     been migrated. New rows are written as 'client' | 'agent' | 'assistant'. */
+  const normalized = (messages || []).map(m => ({
+    ...m,
+    role: m.role === 'user' ? 'client' : m.role,
+  }));
+
   /* If the table is empty for this task, surface the original AI output from
      the tasks row as the first assistant turn. Clients still see a coherent
      thread even before the first follow-up. */
-  let thread = messages || [];
+  let thread = normalized;
   if (thread.length === 0 && loaded.task.ai_output) {
     thread = [{
       id: 'seed-' + taskId,
       role: 'assistant',
       content: loaded.task.ai_output,
       confidence: loaded.task.ai_confidence ?? null,
+      sender_user_id: null,
       created_at: loaded.task.created_at,
       seeded: true,
     }];
   }
 
-  const turnsUsed = (messages || []).filter(m => m.role === 'user').length;
-  const handlerLocked =
-    loaded.task.handler !== 'ai' ||
-    ['review','completed','done'].includes(loaded.task.status);
+  /* Turns used = combined count of human-authored messages (client + agent).
+     Both roles contribute against the same 15-message cap so cost is bounded. */
+  const turnsUsed = normalized.filter(m => m.role === 'client' || m.role === 'agent').length;
+
+  /* Lock the AI thread only when the task is fully finished. Earlier we also
+     locked when status='review' (escalation) — but now agents can use the
+     thread too, so review/active are both allowed. */
+  const handlerLocked = ['completed','done'].includes(loaded.task.status);
 
   res.json({
     messages: thread,
@@ -298,6 +329,9 @@ router.get('/conversation/:taskId', requireAuth, asyncHandler(async (req, res) =
     turns_used: turnsUsed,
     turns_remaining: Math.max(0, MAX_AI_TURNS - turnsUsed),
     handler_locked: handlerLocked,
+    /* Tell the frontend which role the current user has so it can label its
+       own messages distinctly from the other party's. */
+    viewer_role: senderRoleForUser(req.user),
   });
 }));
 
@@ -319,13 +353,13 @@ router.post('/conversation/:taskId',
     const loaded = await loadTaskForAIConversation(taskId, req.user);
     if (loaded.error) return res.status(loaded.status).json({ error: loaded.error });
     const task = loaded.task;
+    const senderRole = senderRoleForUser(req.user);
 
-    // Gate: only allow AI conversation when task is AI-handled and not escalated/completed
-    if (task.handler !== 'ai') {
-      return res.status(409).json({ error: 'This task is being handled by a human agent. Use the Chat tab to message them.' });
-    }
-    if (['review','completed','done'].includes(task.status)) {
-      return res.status(409).json({ error: 'This task is no longer active for AI follow-ups.' });
+    /* Gate: lock only when the task is completely done. Earlier we also locked
+       when status='review' (escalation) — but with shared client+agent chat,
+       agents using the thread on assigned tasks is the whole point. */
+    if (['completed','done'].includes(task.status)) {
+      return res.status(409).json({ error: 'This task is completed. The AI thread is read-only.' });
     }
 
     // Load existing conversation + check turn budget
@@ -339,10 +373,16 @@ router.post('/conversation/:taskId',
       return res.status(500).json({ error: 'Could not load conversation history' });
     }
 
-    const turnsUsed = (existing || []).filter(m => m.role === 'user').length;
+    /* Count both client AND agent messages against the same cap. Treat the
+       legacy 'user' role as 'client' for back-compat with un-migrated rows. */
+    const turnsUsed = (existing || []).filter(m => {
+      const r = m.role === 'user' ? 'client' : m.role;
+      return r === 'client' || r === 'agent';
+    }).length;
+
     if (turnsUsed >= MAX_AI_TURNS) {
       return res.status(429).json({
-        error: `You've used all ${MAX_AI_TURNS} follow-ups for this task. Please request a human review for further help.`,
+        error: `This task has reached the ${MAX_AI_TURNS}-message limit. Please continue in the Chat tab or mark the task complete.`,
         turn_limit_reached: true,
       });
     }
@@ -365,21 +405,40 @@ router.post('/conversation/:taskId',
       contextMessages.push({ role: 'assistant', content: task.ai_output });
     }
 
-    // Append the stored back-and-forth (trim to MAX_CONTEXT_MESSAGES)
+    /* Append the stored back-and-forth (trim to MAX_CONTEXT_MESSAGES).
+       Translate our domain roles to Anthropic's API roles:
+       - 'client' or 'agent' → 'user' (both are "the human in the chat")
+       - 'assistant' → 'assistant'
+       Prefix human messages with the sender label so the model can address
+       the right person when relevant. */
     const recentHistory = (existing || []).slice(-MAX_CONTEXT_MESSAGES);
     for (const m of recentHistory) {
-      contextMessages.push({ role: m.role, content: m.content });
+      const domainRole = m.role === 'user' ? 'client' : m.role;
+      if (domainRole === 'assistant') {
+        contextMessages.push({ role: 'assistant', content: m.content });
+      } else {
+        const label = domainRole === 'agent' ? '[Agent]' : '[Client]';
+        contextMessages.push({ role: 'user', content: `${label} ${m.content}` });
+      }
     }
 
-    // Append the new user message
-    contextMessages.push({ role: 'user', content: userMessage });
+    /* Append the new human message — labelled so the AI knows whether it's
+       responding to the client or the agent. */
+    const senderLabel = senderRole === 'agent' ? '[Agent]' : '[Client]';
+    contextMessages.push({
+      role: 'user',
+      content: `${senderLabel} ${userMessage}`,
+    });
 
-    // System prompt: ground the model in the original task + this is a
-    // follow-up conversation, not a fresh task.
+    /* System prompt: AI knows it's now in a three-way conversation. Important
+       that it addresses whoever asked the latest question; otherwise responses
+       feel disconnected when client and agent both contribute. */
     const systemPrompt = [
-      `You are Panalo.ai's task-completion assistant continuing a conversation with a client about their task.`,
-      `The client has already received your initial response and is following up.`,
-      `Provide concrete, actionable answers. If you need more information, ask one specific question.`,
+      `You are Panalo.ai's task-completion assistant. This conversation now includes BOTH the client (who submitted the task) and the assigned human agent (a Panalo team member helping the client).`,
+      `Messages are labelled [Client] or [Agent] so you know who's speaking.`,
+      `Address whoever asked the most recent question. When relevant, name them explicitly ("To answer your question, agent…") so everyone follows along.`,
+      `If the agent is verifying or correcting earlier information, defer to them — they have context you may not.`,
+      `Provide concrete, actionable answers. If you need more information, ask one specific question of the relevant party.`,
       `Keep responses focused — 3–6 short paragraphs max. Use markdown for clarity.`,
       `End your response with a confidence score on a new line: [Confidence: NN%]`,
     ].join('\n');
@@ -410,15 +469,16 @@ router.post('/conversation/:taskId',
       return res.status(502).json({ error: 'The AI returned an empty response. Please try again.' });
     }
 
-    // Persist BOTH messages atomically (well, sequentially — Supabase doesn't
-    // do transactions over the JS client, but these inserts almost never fail
-    // independently).
+    /* Persist BOTH messages atomically (sequentially in practice).
+       The new human message uses the actual sender role ('client' or 'agent')
+       so the UI can label it correctly to all viewers. */
     const now = new Date().toISOString();
     const userRow = {
       id: crypto.randomUUID(),
       task_id: taskId,
-      role: 'user',
+      role: senderRole,                  // 'client' | 'agent'
       content: userMessage,
+      sender_user_id: req.user.id,
       created_at: now,
     };
     const assistantRow = {
@@ -427,6 +487,7 @@ router.post('/conversation/:taskId',
       role: 'assistant',
       content: aiText,
       confidence,
+      sender_user_id: null,
       // tiny offset so it sorts after the user message
       created_at: new Date(Date.now() + 1).toISOString(),
     };
@@ -451,7 +512,7 @@ router.post('/conversation/:taskId',
       .then(() => {}, () => {});
 
     logger.info('AI conversation turn', {
-      taskId, userId: req.user.id,
+      taskId, userId: req.user.id, senderRole,
       turnsUsed: turnsUsed + 1, confidence,
     });
 

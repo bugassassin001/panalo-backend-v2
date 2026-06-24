@@ -298,21 +298,41 @@ router.get('/conversation/:taskId', requireAuth, asyncHandler(async (req, res) =
     role: m.role === 'user' ? 'client' : m.role,
   }));
 
-  /* If the table is empty for this task, surface the original AI output from
-     the tasks row as the first assistant turn. Clients still see a coherent
-     thread even before the first follow-up. */
-  let thread = normalized;
-  if (thread.length === 0 && loaded.task.ai_output) {
-    thread = [{
-      id: 'seed-' + taskId,
+  /* Always prepend two synthetic "seed" messages built from the tasks row:
+       1. The original task description as the first client message
+       2. The original AI output as the first assistant message
+     These are NOT stored — they're computed every time so they survive any
+     amount of follow-up activity. The agent and client always see the full
+     conversation history regardless of how many turns have been taken. */
+  const seedMessages = [];
+  if (loaded.task.title || loaded.task.description) {
+    const taskContent = [loaded.task.title, loaded.task.description]
+      .filter(Boolean).join('\n\n');
+    seedMessages.push({
+      id: 'seed-task-' + taskId,
+      role: 'client',
+      content: taskContent,
+      confidence: null,
+      sender_user_id: loaded.task.client_id,
+      created_at: loaded.task.created_at,
+      seeded: true,
+    });
+  }
+  if (loaded.task.ai_output) {
+    seedMessages.push({
+      id: 'seed-ai-' + taskId,
       role: 'assistant',
       content: loaded.task.ai_output,
       confidence: loaded.task.ai_confidence ?? null,
       sender_user_id: null,
-      created_at: loaded.task.created_at,
+      /* +1ms after the task created_at so it sorts after the client task seed */
+      created_at: loaded.task.created_at
+        ? new Date(new Date(loaded.task.created_at).getTime() + 1).toISOString()
+        : null,
       seeded: true,
-    }];
+    });
   }
+  const thread = [...seedMessages, ...normalized];
 
   /* Turns used = combined count of human-authored messages (client + agent).
      Both roles contribute against the same 15-message cap so cost is bounded. */
@@ -387,21 +407,20 @@ router.post('/conversation/:taskId',
       });
     }
 
-    // Build the context window for Anthropic. Start with the original task as
-    // the first user message, then include the seeded AI output (from the
-    // tasks row) if we don't have a stored turn for it.
+    // Build the context window for Anthropic. ALWAYS start with the original
+    // task as the first user message AND the original AI output as the first
+    // assistant message — regardless of how many follow-ups exist. This keeps
+    // the AI grounded in the original ask and its initial detailed answer.
     const contextMessages = [];
 
-    // First user turn = the original task description
+    // Seed 1: the original task description as the first user turn
     contextMessages.push({
       role: 'user',
       content: task.title + (task.description ? `\n\n${task.description}` : ''),
     });
 
-    // First assistant turn = the original ai_output (only if there are no
-    // stored assistant turns yet — otherwise the stored history is canonical)
-    const hasStoredAssistantTurn = (existing || []).some(m => m.role === 'assistant');
-    if (!hasStoredAssistantTurn && task.ai_output) {
+    // Seed 2: the original ai_output as the first assistant turn (always)
+    if (task.ai_output) {
       contextMessages.push({ role: 'assistant', content: task.ai_output });
     }
 

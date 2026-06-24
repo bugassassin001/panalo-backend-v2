@@ -306,17 +306,26 @@ router.get('/conversation/:taskId', requireAuth, asyncHandler(async (req, res) =
      conversation history regardless of how many turns have been taken. */
   const seedMessages = [];
   if (loaded.task.title || loaded.task.description) {
-    const taskContent = [loaded.task.title, loaded.task.description]
-      .filter(Boolean).join('\n\n');
-    seedMessages.push({
-      id: 'seed-task-' + taskId,
-      role: 'client',
-      content: taskContent,
-      confidence: null,
-      sender_user_id: loaded.task.client_id,
-      created_at: loaded.task.created_at,
-      seeded: true,
-    });
+    /* Collapse parts: avoid duplicates when title === description (a common
+       outcome when the client only filled the title in the new-task form,
+       or when the form auto-mirrors title into description). Also trims
+       whitespace-only strings out of the join. */
+    const parts = [loaded.task.title, loaded.task.description]
+      .map(s => (s || '').trim())
+      .filter(Boolean);
+    const uniqueParts = [...new Set(parts)]; // de-dupe identical strings
+    const taskContent = uniqueParts.join('\n\n');
+    if (taskContent) {
+      seedMessages.push({
+        id: 'seed-task-' + taskId,
+        role: 'client',
+        content: taskContent,
+        confidence: null,
+        sender_user_id: loaded.task.client_id,
+        created_at: loaded.task.created_at,
+        seeded: true,
+      });
+    }
   }
   if (loaded.task.ai_output) {
     seedMessages.push({
@@ -413,11 +422,16 @@ router.post('/conversation/:taskId',
     // the AI grounded in the original ask and its initial detailed answer.
     const contextMessages = [];
 
-    // Seed 1: the original task description as the first user turn
-    contextMessages.push({
-      role: 'user',
-      content: task.title + (task.description ? `\n\n${task.description}` : ''),
-    });
+    // Seed 1: the original task description as the first user turn.
+    // De-duplicate title vs description (common when the new-task form
+    // mirrors title into description) so the AI doesn't see the same text twice.
+    const seedParts = [task.title, task.description]
+      .map(s => (s || '').trim())
+      .filter(Boolean);
+    const seedContent = [...new Set(seedParts)].join('\n\n');
+    if (seedContent) {
+      contextMessages.push({ role: 'user', content: seedContent });
+    }
 
     // Seed 2: the original ai_output as the first assistant turn (always)
     if (task.ai_output) {

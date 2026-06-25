@@ -327,21 +327,49 @@ router.get('/conversation/:taskId', requireAuth, asyncHandler(async (req, res) =
       });
     }
   }
-  if (loaded.task.ai_output) {
+  /* AI seed bubble — the "original AI answer". Try multiple sources because
+     historically tasks.ai_output got overwritten on every follow-up (now
+     fixed), and some tasks may have NULL ai_output if the original AI call
+     failed or the field was cleared. Order of preference:
+       1. tasks.ai_output if present (the canonical original answer)
+       2. The earliest stored assistant message in task_ai_messages as fallback
+     If we use the fallback, we mark that stored message as "absorbed" so it
+     doesn't render TWICE (once as seed, once as regular bubble). */
+  let aiSeedContent     = loaded.task.ai_output || null;
+  let aiSeedConfidence  = loaded.task.ai_confidence ?? null;
+  let absorbedStoredId  = null;
+
+  if (!aiSeedContent) {
+    const firstAssistant = normalized.find(m => m.role === 'assistant');
+    if (firstAssistant) {
+      aiSeedContent    = firstAssistant.content;
+      aiSeedConfidence = firstAssistant.confidence ?? null;
+      absorbedStoredId = firstAssistant.id;
+    }
+  }
+
+  if (aiSeedContent) {
     seedMessages.push({
       id: 'seed-ai-' + taskId,
       role: 'assistant',
-      content: loaded.task.ai_output,
-      confidence: loaded.task.ai_confidence ?? null,
+      content: aiSeedContent,
+      confidence: aiSeedConfidence,
       sender_user_id: null,
-      /* +1ms after the task created_at so it sorts after the client task seed */
+      /* +1ms after the task created_at so it sorts right after the client task seed */
       created_at: loaded.task.created_at
         ? new Date(new Date(loaded.task.created_at).getTime() + 1).toISOString()
         : null,
       seeded: true,
     });
   }
-  const thread = [...seedMessages, ...normalized];
+
+  /* Drop the absorbed message from the regular stream to avoid duplication.
+     (Only applies when we fell back to a stored message for the seed.) */
+  const remainingStored = absorbedStoredId
+    ? normalized.filter(m => m.id !== absorbedStoredId)
+    : normalized;
+
+  const thread = [...seedMessages, ...remainingStored];
 
   /* Turns used = combined count of human-authored messages (client + agent).
      Both roles contribute against the same 15-message cap so cost is bounded. */
@@ -533,14 +561,14 @@ router.post('/conversation/:taskId',
       return res.status(500).json({ error: 'Could not save the conversation' });
     }
 
-    // Best-effort: update the task's ai_output to the latest assistant
-    // response so the original AI Output card stays fresh. Also bump ai_confidence.
+    /* Update only updated_at on the parent task. We intentionally do NOT
+       overwrite tasks.ai_output anymore — that field holds the ORIGINAL AI
+       response from task creation and must stay intact. The follow-up replies
+       live in task_ai_messages where they belong. Overwriting ai_output here
+       used to clobber the original detailed answer with the latest follow-up,
+       which made the conversation history confusing and lost important context. */
     supabase.from('tasks')
-      .update({
-        ai_output: aiText,
-        ai_confidence: confidence ?? task.ai_confidence,
-        updated_at: now,
-      })
+      .update({ updated_at: now })
       .eq('id', taskId)
       .then(() => {}, () => {});
 

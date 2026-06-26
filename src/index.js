@@ -25,6 +25,7 @@ import adminUsersRoutes from './routes/admin-users.js';   // ← NEW (agent/admi
 import webhookRoutes   from './routes/webhooks.js';
 import leadsRoutes     from './routes/leads.js';
 import aiRoutes        from './routes/ai.js';        // ← NEW
+import notesRoutes     from './routes/notes.js';     // ← NEW (per-task notes + files)
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -113,6 +114,7 @@ app.use('/api/admin',    adminUsersRoutes);  // ← NEW (handles /users invite e
 app.use('/api/webhooks', webhookRoutes);
 app.use('/api/leads',    leadsRoutes);   // ← NEW (or already mounted)
 app.use('/api/ai',       aiRoutes);      // ← NEW
+app.use('/api/notes',    notesRoutes);   // ← NEW (per-task notes + file uploads)
 
 // ── 404 + Error handling ─────────────────────────────────────────────────────
 app.use(notFound);

@@ -13,6 +13,7 @@ import rateLimit from 'express-rate-limit';
 import { logger } from './lib/logger.js';
 import { errorHandler, notFound } from './middleware/error.js';
 import { initQueue } from './workers/taskQueue.js';
+import { startMessageNotifier } from './workers/messageNotifier.js';
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 import authRoutes      from './routes/auth.js';
@@ -129,6 +130,15 @@ async function start() {
         error: err.message,
       });
     });
+
+    // Start the message notifier worker. Runs every minute and sends batched
+    // email notifications for unread messages older than 15 min. Doesn't need
+    // Redis — uses Postgres as the queue. Safe if Resend isn't configured —
+    // it'll log warnings but not crash the server.
+    try { startMessageNotifier(); }
+    catch (err) {
+      logger.warn('Message notifier failed to start (chat emails disabled)', { error: err.message });
+    }
 
     app.listen(PORT, () => {
       logger.info(`🚀 Panalo.ai backend running`, {

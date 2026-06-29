@@ -4,7 +4,6 @@ import { v4 as uuid } from 'uuid';
 import { supabase } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/error.js';
-import { sendAgentMessageEmail } from '../lib/email.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
@@ -130,11 +129,10 @@ router.post('/:taskId', [
     return res.status(500).json({ error: 'Could not send message' });
   }
 
-  // If agent is messaging — email the client. Best-effort.
-  if ((req.user.role === 'agent' || req.user.role === 'admin') && task.client?.email) {
-    sendAgentMessageEmail(task.client, task, messageBody)
-      .catch(err => logger.warn('Agent message email failed', { error: err.message }));
-  }
+  /* No immediate email on every message — the message notifier worker
+     (src/workers/messageNotifier.js) runs every minute and sends a single
+     batched notification 15 minutes after the recipient hasn't read it,
+     with a 1-email-per-task-per-hour cooldown. See its file for details. */
 
   logger.info('Message sent', { taskId, senderRole: req.user.role, msgId: message.id });
   res.status(201).json({ message });

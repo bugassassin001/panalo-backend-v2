@@ -528,3 +528,154 @@ export async function sendAgentInviteEmail({
       `This link expires in 7 days. If you weren't expecting this email, ignore it.`,
   });
 }
+
+/* ============================================================
+   APPEND THIS TO YOUR EXISTING backend/src/lib/email.js
+   (Or merge if you've reorganized — the only NEW export is
+    sendChatNotificationEmail; the rest is unchanged.)
+============================================================ */
+
+/* sendChatNotificationEmail — used by the message notifier worker.
+   Sends ONE email summarizing all unread chat messages on a task for a
+   given recipient (client OR agent). Uses the same Resend transport as
+   your other emails. */
+export async function sendChatNotificationEmail({
+  recipient,
+  recipientRole,        // 'client' | 'agent'
+  task,
+  messages,             // array of message rows
+}) {
+  if (!recipient?.email) {
+    throw new Error('sendChatNotificationEmail: recipient missing email');
+  }
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return; // nothing to send
+  }
+
+  const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.panalo.ai';
+
+  /* Where the recipient lands when they click the email — direct to their
+     dashboard. The task ID is appended so the frontend can auto-open the
+     task panel. */
+  const dashboardPath = recipientRole === 'agent' ? 'agent.html' : 'dashboard.html';
+  const ctaUrl = `${FRONTEND_URL}/${dashboardPath}?task=${encodeURIComponent(task.id)}`;
+
+  const recipientName =
+    `${recipient.first_name || ''} ${recipient.last_name || ''}`.trim() ||
+    recipient.email.split('@')[0];
+
+  const taskTitle = (task.title || 'your task').slice(0, 120);
+  const isMultiple = messages.length > 1;
+
+  /* Sender summary — "Janelle Saulog" or "Janelle and 1 other".
+     Pulls sender_name straight off the message rows so we don't have to
+     re-query for user names. */
+  const senderNames = [...new Set(messages.map(m => m.sender_name).filter(Boolean))];
+  const senderLabel = senderNames.length === 0
+    ? (recipientRole === 'client' ? 'Your Panalo agent' : 'Your client')
+    : senderNames.length === 1
+      ? senderNames[0]
+      : `${senderNames[0]} and ${senderNames.length - 1} other${senderNames.length > 2 ? 's' : ''}`;
+
+  const subject = isMultiple
+    ? `${messages.length} new messages from ${senderLabel} — "${taskTitle}"`
+    : `New message from ${senderLabel} — "${taskTitle}"`;
+
+  /* Build HTML body — keep it simple, plain, no fancy fonts or imagery so
+     it renders cleanly in Gmail/Outlook/dark mode. */
+  const messagesHtml = messages.slice(0, 5).map(m => {
+    const body = String(m.body || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .slice(0, 400);
+    const sender = m.sender_name || (m.sender_type === 'client' ? 'Client' : 'Agent');
+    const time = m.created_at
+      ? new Date(m.created_at).toLocaleString('en-US', {
+          month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+        })
+      : '';
+    return `
+      <div style="border-left: 3px solid #00d4aa; padding: 8px 12px; margin-bottom: 12px; background: #f7f9fa;">
+        <div style="font-size: 12px; color: #6b7280; margin-bottom: 4px;">
+          <strong>${sender}</strong>${time ? ` · ${time}` : ''}
+        </div>
+        <div style="font-size: 14px; color: #1f2937; line-height: 1.5; white-space: pre-wrap;">${body}</div>
+      </div>`;
+  }).join('');
+
+  const moreNote = messages.length > 5
+    ? `<div style="font-size: 12px; color: #6b7280; margin-bottom: 16px;">
+         ...and ${messages.length - 5} more message${messages.length - 5 === 1 ? '' : 's'}.
+       </div>`
+    : '';
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <body style="margin: 0; padding: 0; background: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f3f4f6;padding:32px 12px;">
+        <tr><td align="center">
+          <table width="560" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;border-radius:10px;border:1px solid #e5e7eb;">
+            <tr><td style="padding: 32px 36px 16px 36px;">
+              <div style="font-size: 20px; font-weight: 700; color: #111827;">
+                Panalo<span style="color:#00d4aa;">.ai</span>
+              </div>
+            </td></tr>
+            <tr><td style="padding: 0 36px 16px 36px;">
+              <h1 style="margin: 0 0 8px 0; font-size: 22px; font-weight: 600; color: #111827;">
+                Hi ${recipientName.split(' ')[0]},
+              </h1>
+              <p style="margin: 0; font-size: 15px; line-height: 1.55; color: #374151;">
+                You have ${isMultiple ? `<strong>${messages.length} new messages</strong>` : 'a new message'}
+                on your task <strong>&ldquo;${taskTitle}&rdquo;</strong>.
+              </p>
+            </td></tr>
+            <tr><td style="padding: 16px 36px 8px 36px;">
+              ${messagesHtml}
+              ${moreNote}
+            </td></tr>
+            <tr><td align="center" style="padding: 8px 36px 28px 36px;">
+              <a href="${ctaUrl}"
+                 style="display: inline-block; background: #00d4aa; color: #07070c; text-decoration: none; font-weight: 600; padding: 12px 28px; border-radius: 8px; font-size: 14px;">
+                View and reply →
+              </a>
+            </td></tr>
+            <tr><td style="padding: 0 36px 28px 36px; border-top: 1px solid #e5e7eb; padding-top: 16px;">
+              <p style="margin: 0; font-size: 12px; line-height: 1.5; color: #6b7280;">
+                You're receiving this because you have unread messages on a task you submitted on Panalo.ai.
+                Reply directly in the dashboard.
+              </p>
+            </td></tr>
+          </table>
+        </td></tr>
+      </table>
+    </body>
+    </html>`;
+
+  const text = [
+    `Hi ${recipientName.split(' ')[0]},`,
+    '',
+    isMultiple
+      ? `You have ${messages.length} new messages on your task "${taskTitle}".`
+      : `You have a new message from ${senderLabel} on your task "${taskTitle}".`,
+    '',
+    ...messages.slice(0, 5).map(m => {
+      const sender = m.sender_name || (m.sender_type === 'client' ? 'Client' : 'Agent');
+      return `--- ${sender} ---\n${(m.body || '').slice(0, 400)}\n`;
+    }),
+    messages.length > 5 ? `(and ${messages.length - 5} more)\n` : '',
+    `View and reply: ${ctaUrl}`,
+    '',
+    `— Panalo.ai`,
+  ].join('\n');
+
+  /* Use your existing Resend client — replace `resend` with however your
+     existing email.js exposes it. The Resend SDK takes `from`, `to`,
+     `subject`, `html`, `text`. */
+  await resend.emails.send({
+    from: process.env.EMAIL_FROM || 'Panalo.ai <noreply@panalo.ai>',
+    to: recipient.email,
+    subject,
+    html,
+    text,
+  });
+}

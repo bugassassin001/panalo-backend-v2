@@ -668,11 +668,10 @@ export async function sendChatNotificationEmail({
     `— Panalo.ai`,
   ].join('\n');
 
-  /* Use your existing Resend client — replace `resend` with however your
-     existing email.js exposes it. The Resend SDK takes `from`, `to`,
-     `subject`, `html`, `text`. */
-  await resend.emails.send({
-    from: process.env.EMAIL_FROM || 'Panalo.ai <noreply@panalo.ai>',
+  /* Send via the existing sendEmail() helper at the top of this file.
+     It already handles the Resend REST API call, dev-mode skipping, error
+     logging, and from-address defaults. */
+  await sendEmail({
     to: recipient.email,
     subject,
     html,

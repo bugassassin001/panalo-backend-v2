@@ -235,6 +235,25 @@ const MAX_AI_TURNS         = 15;   // human messages (client+agent combined) per
 const MAX_CONTEXT_MESSAGES = 20;   // keep at most this many msgs in the context window
 const MAX_CONVERSATION_TOKENS_OUT = 800;
 
+/* ── File attachment constants ────────────────────────────────────
+   Files attached to AI messages are stored in the shared task-notes Supabase
+   Storage bucket under the path {taskId}/ai-chat/{uuid}.ext, so we reuse
+   the same bucket setup and RLS story as the Notes feature. */
+const AI_FILES_BUCKET             = 'task-notes';
+const AI_FILES_PATH_PREFIX        = 'ai-chat';   // folder inside the bucket
+const AI_MAX_FILES_PER_MESSAGE    = 1;           // one file per turn keeps cost + context predictable
+const AI_MAX_FILE_SIZE_BYTES      = 5 * 1024 * 1024;   // 5 MB — small files only
+const AI_SIGNED_UPLOAD_TTL_SEC    = 60 * 5;      // browser has 5 min to actually upload after signing
+const AI_SIGNED_READ_TTL_SEC      = 60 * 60 * 24; // 24h — re-signed on each GET
+
+/* Only file types Claude can actually read. Anything else would just be a
+   dead attachment — reject at upload time. */
+const AI_ALLOWED_MIME_TYPES = [
+  'image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif',
+  'application/pdf',
+  'text/plain', 'text/markdown', 'text/csv',
+];
+
 // Per-user rate limit for AI conversation turns (separate from preview limiter)
 const aiChatLimiter = rateLimit({
   windowMs: 60 * 1000,           // 1 minute window
@@ -282,7 +301,7 @@ router.get('/conversation/:taskId', requireAuth, asyncHandler(async (req, res) =
 
   const { data: messages, error } = await supabase
     .from('task_ai_messages')
-    .select('id, role, content, confidence, sender_user_id, created_at')
+    .select('id, role, content, confidence, sender_user_id, files, created_at')
     .eq('task_id', taskId)
     .order('created_at', { ascending: true });
 
@@ -292,8 +311,27 @@ router.get('/conversation/:taskId', requireAuth, asyncHandler(async (req, res) =
   }
 
   /* Normalize the legacy 'user' role to 'client' for any old rows that haven't
-     been migrated. New rows are written as 'client' | 'agent' | 'assistant'. */
-  const normalized = (messages || []).map(m => ({
+     been migrated. New rows are written as 'client' | 'agent' | 'assistant'.
+     Also refresh signed read URLs for any attached files so the browser can
+     download them via a short-lived URL. */
+  const messagesWithFreshUrls = await Promise.all((messages || []).map(async m => {
+    const files = Array.isArray(m.files) ? m.files : [];
+    let filesWithUrls = files;
+    if (files.length > 0) {
+      const paths = files.map(f => f.storage_path).filter(Boolean);
+      if (paths.length > 0) {
+        const { data: signed } = await supabase.storage
+          .from(AI_FILES_BUCKET)
+          .createSignedUrls(paths, AI_SIGNED_READ_TTL_SEC);
+        if (signed) {
+          filesWithUrls = files.map((f, i) => ({ ...f, url: signed[i]?.signedUrl || null }));
+        }
+      }
+    }
+    return { ...m, files: filesWithUrls };
+  }));
+
+  const normalized = messagesWithFreshUrls.map(m => ({
     ...m,
     role: m.role === 'user' ? 'client' : m.role,
   }));
@@ -392,6 +430,60 @@ router.get('/conversation/:taskId', requireAuth, asyncHandler(async (req, res) =
   });
 }));
 
+// ── POST /api/ai/conversation/:taskId/upload-url ───────────────────────────
+// Returns a signed Supabase Storage URL the browser can PUT a file to
+// directly (bypasses Railway's request-size limit and saves bandwidth).
+// Same authorization as the conversation endpoint below.
+router.post('/conversation/:taskId/upload-url', requireAuth, asyncHandler(async (req, res) => {
+  const { taskId } = req.params;
+  const { filename, mime_type, size_bytes } = req.body || {};
+
+  const loaded = await loadTaskForAIConversation(taskId, req.user);
+  if (loaded.error) return res.status(loaded.status).json({ error: loaded.error });
+
+  /* Validate — filename required, MIME must be in allowlist, size under cap */
+  if (!filename || typeof filename !== 'string') {
+    return res.status(400).json({ error: 'filename is required' });
+  }
+  if (!mime_type || !AI_ALLOWED_MIME_TYPES.includes(mime_type)) {
+    return res.status(400).json({
+      error: `File type "${mime_type || 'unknown'}" is not supported. Supported: images (PNG/JPG/WebP/GIF), PDF, text (TXT/MD/CSV).`,
+    });
+  }
+  if (typeof size_bytes === 'number' && size_bytes > AI_MAX_FILE_SIZE_BYTES) {
+    return res.status(400).json({
+      error: `File too large (${Math.round(size_bytes / 1024 / 1024)} MB). Max ${AI_MAX_FILE_SIZE_BYTES / 1024 / 1024} MB per file.`,
+    });
+  }
+
+  const extMatch = filename.match(/\.[a-z0-9]{1,8}$/i);
+  const ext = extMatch ? extMatch[0].toLowerCase() : '';
+  const storagePath = `${taskId}/${AI_FILES_PATH_PREFIX}/${crypto.randomUUID()}${ext}`;
+
+  const { data, error } = await supabase.storage
+    .from(AI_FILES_BUCKET)
+    .createSignedUploadUrl(storagePath);
+
+  if (error) {
+    logger.error('AI file upload URL failed', { taskId, error: error.message });
+    return res.status(500).json({
+      error: 'Could not start file upload. Storage may not be configured.',
+    });
+  }
+
+  res.json({
+    upload_url: data.signedUrl,
+    storage_path: storagePath,
+    /* Echo the metadata the client should POST back to /conversation later */
+    file_meta: {
+      name: filename,
+      type: mime_type,
+      size: size_bytes || 0,
+      storage_path: storagePath,
+    },
+  });
+}));
+
 // ── POST /api/ai/conversation/:taskId ───────────────────────────────────────
 router.post('/conversation/:taskId',
   requireAuth,
@@ -406,6 +498,32 @@ router.post('/conversation/:taskId',
 
     const { taskId } = req.params;
     const userMessage = req.body.message.trim();
+
+    /* Optional file attachments — each must reference an already-uploaded
+       object in Storage (via the signed-upload endpoint above). We validate
+       shape here and fetch the actual bytes further down. */
+    const rawFiles = Array.isArray(req.body.files) ? req.body.files : [];
+    if (rawFiles.length > AI_MAX_FILES_PER_MESSAGE) {
+      return res.status(400).json({
+        error: `Only ${AI_MAX_FILES_PER_MESSAGE} file per message is allowed.`,
+      });
+    }
+    const attachedFiles = rawFiles.map(f => ({
+      name: String(f.name || 'file'),
+      type: String(f.type || 'application/octet-stream'),
+      size: Number(f.size || 0),
+      storage_path: String(f.storage_path || ''),
+    })).filter(f => f.storage_path);
+    /* Re-validate MIME types to make sure the browser didn't lie about a file
+       it uploaded (we only signed URLs for allowed types, but a curl request
+       could still craft bad rows). */
+    for (const f of attachedFiles) {
+      if (!AI_ALLOWED_MIME_TYPES.includes(f.type)) {
+        return res.status(400).json({
+          error: `File type "${f.type}" is not supported for AI reading.`,
+        });
+      }
+    }
 
     const loaded = await loadTaskForAIConversation(taskId, req.user);
     if (loaded.error) return res.status(loaded.status).json({ error: loaded.error });
@@ -484,12 +602,73 @@ router.post('/conversation/:taskId',
     }
 
     /* Append the new human message — labelled so the AI knows whether it's
-       responding to the client or the agent. */
+       responding to the client or the agent.
+
+       If files are attached to this turn, we build a multipart "content"
+       array with image/document blocks per Claude's messages API. If no
+       files, content stays a plain string. Files are ONLY sent on this
+       turn — future turns rely on Claude's response having captured what
+       it needed from the file. That keeps per-turn cost predictable. */
     const senderLabel = senderRole === 'agent' ? '[Agent]' : '[Client]';
-    contextMessages.push({
-      role: 'user',
-      content: `${senderLabel} ${userMessage}`,
-    });
+    const textPart = `${senderLabel} ${userMessage}`;
+
+    if (attachedFiles.length === 0) {
+      contextMessages.push({ role: 'user', content: textPart });
+    } else {
+      const contentBlocks = [];
+
+      /* Download each file from Storage and turn it into a Claude content
+         block. Small files only (5 MB cap), so this is fast and cheap. */
+      for (const f of attachedFiles) {
+        try {
+          const { data: fileBytes, error: dlErr } = await supabase.storage
+            .from(AI_FILES_BUCKET).download(f.storage_path);
+          if (dlErr || !fileBytes) {
+            logger.error('AI file download failed', {
+              taskId, path: f.storage_path, error: dlErr?.message,
+            });
+            return res.status(500).json({
+              error: `Could not read attached file "${f.name}". Please try uploading again.`,
+            });
+          }
+          const buffer = Buffer.from(await fileBytes.arrayBuffer());
+          const base64 = buffer.toString('base64');
+
+          if (f.type.startsWith('image/')) {
+            contentBlocks.push({
+              type: 'image',
+              source: { type: 'base64', media_type: f.type, data: base64 },
+            });
+          } else if (f.type === 'application/pdf') {
+            contentBlocks.push({
+              type: 'document',
+              source: { type: 'base64', media_type: 'application/pdf', data: base64 },
+            });
+          } else if (f.type.startsWith('text/')) {
+            /* Inline text — cheaper than PDF document blocks and Claude
+               handles it natively as part of the prompt. Cap to ~20K chars
+               so a 5 MB CSV doesn't blow the context window. */
+            const text = buffer.toString('utf8').slice(0, 20000);
+            contentBlocks.push({
+              type: 'text',
+              text: `[Attached file: ${f.name}]\n\`\`\`\n${text}\n\`\`\``,
+            });
+          }
+        } catch (err) {
+          logger.error('AI file processing error', {
+            taskId, name: f.name, error: err.message,
+          });
+          return res.status(500).json({
+            error: `Could not process attached file "${f.name}".`,
+          });
+        }
+      }
+
+      /* Text always comes last so Claude sees the file(s) FIRST as context,
+         then the actual question. Follows Anthropic's recommended ordering. */
+      contentBlocks.push({ type: 'text', text: textPart });
+      contextMessages.push({ role: 'user', content: contentBlocks });
+    }
 
     /* System prompt: AI knows it's now in a three-way conversation. Important
        that it addresses whoever asked the latest question; otherwise responses
@@ -540,6 +719,7 @@ router.post('/conversation/:taskId',
       role: senderRole,                  // 'client' | 'agent'
       content: userMessage,
       sender_user_id: req.user.id,
+      files: attachedFiles,              // stored as JSONB; empty array if none
       created_at: now,
     };
     const assistantRow = {
@@ -575,6 +755,7 @@ router.post('/conversation/:taskId',
     logger.info('AI conversation turn', {
       taskId, userId: req.user.id, senderRole,
       turnsUsed: turnsUsed + 1, confidence,
+      fileCount: attachedFiles.length,
     });
 
     res.json({

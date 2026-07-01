@@ -9,6 +9,50 @@ import { logger } from '../lib/logger.js';
 const router = Router();
 router.use(requireAuth);
 
+/* ── File attachment constants ────────────────────────────────────
+   Chat files are stored in the shared `task-notes` Supabase Storage bucket
+   under {taskId}/chat/{uuid}.ext so we reuse the same bucket + auth story
+   as the Notes feature. */
+const CHAT_FILES_BUCKET             = 'task-notes';
+const CHAT_FILES_PATH_PREFIX        = 'chat';
+const CHAT_MAX_FILES_PER_MESSAGE    = 3;                        // enough for a few screenshots
+const CHAT_MAX_FILE_SIZE_BYTES      = 10 * 1024 * 1024;         // 10 MB per file
+const CHAT_SIGNED_UPLOAD_TTL_SEC    = 60 * 5;                   // 5 min to actually upload
+const CHAT_SIGNED_READ_TTL_SEC      = 60 * 60 * 24;             // 24h — refreshed on each GET
+
+/* Allowed MIME prefixes — matches Notes so users have a consistent experience */
+const CHAT_ALLOWED_MIME_PREFIXES = [
+  'image/',
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument',
+  'application/vnd.ms-',
+  'application/msword',
+  'text/',
+  'application/zip',
+  'application/x-zip-compressed',
+  'application/json',
+];
+const CHAT_BLOCKED_EXTENSIONS = [
+  '.exe', '.bat', '.cmd', '.com', '.sh', '.app', '.dmg',
+  '.jar', '.msi', '.scr', '.vbs', '.ps1', '.apk', '.deb', '.rpm',
+];
+
+/* Refresh signed read URLs for the JSONB files column. Bucket is private
+   so we need short-lived signed URLs each time we return messages. */
+async function refreshFileUrls(files) {
+  if (!Array.isArray(files) || files.length === 0) return [];
+  const paths = files.map(f => f.storage_path).filter(Boolean);
+  if (paths.length === 0) return files;
+  const { data, error } = await supabase.storage
+    .from(CHAT_FILES_BUCKET)
+    .createSignedUrls(paths, CHAT_SIGNED_READ_TTL_SEC);
+  if (error) {
+    logger.warn('Chat refreshFileUrls failed', { error: error.message });
+    return files;
+  }
+  return files.map((f, i) => ({ ...f, url: data[i]?.signedUrl || f.url }));
+}
+
 // Helper: load a task + the requesting user's display name in one place.
 // Returns { task, senderName } or { error, status }.
 async function authorizeAndLoad(taskId, user) {
@@ -85,12 +129,21 @@ router.get('/:taskId', asyncHandler(async (req, res) => {
       .then(() => {}, () => {});
   }
 
-  res.json({ messages: messages || [] });
+  /* Refresh signed URLs for any files attached to these messages.
+     Done in parallel — fast even for a chat with many attachments. */
+  const messagesWithFreshUrls = await Promise.all((messages || []).map(async m => ({
+    ...m,
+    files: await refreshFileUrls(m.files),
+  })));
+
+  res.json({ messages: messagesWithFreshUrls });
 }));
 
 // ── POST /api/messages/:taskId ───────────────────────────────────────────────
 router.post('/:taskId', [
-  body('body').notEmpty().trim().isLength({ max: 2000 }),
+  /* body is now OPTIONAL when files are attached — enforced in the handler
+     because express-validator can't easily express "one of these two". */
+  body('body').optional({ nullable: true }).isString().trim().isLength({ max: 2000 }),
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -98,7 +151,27 @@ router.post('/:taskId', [
   }
 
   const { taskId } = req.params;
-  const { body: messageBody } = req.body;
+  const messageBody = (req.body?.body || '').trim();
+
+  /* Optional file attachments — each must reference an already-uploaded
+     object in Storage (via /api/messages/:taskId/upload-url). */
+  const rawFiles = Array.isArray(req.body?.files) ? req.body.files : [];
+  if (rawFiles.length > CHAT_MAX_FILES_PER_MESSAGE) {
+    return res.status(400).json({
+      error: `Max ${CHAT_MAX_FILES_PER_MESSAGE} files per message.`,
+    });
+  }
+  const attachedFiles = rawFiles.map(f => ({
+    name: String(f.name || 'file'),
+    type: String(f.type || 'application/octet-stream'),
+    size: Number(f.size || 0),
+    storage_path: String(f.storage_path || ''),
+  })).filter(f => f.storage_path);
+
+  /* Require either text or at least one file — but not both empty. */
+  if (!messageBody && attachedFiles.length === 0) {
+    return res.status(400).json({ error: 'Message must have text or at least one file.' });
+  }
 
   const auth = await authorizeAndLoad(taskId, req.user);
   if (auth.error) return res.status(auth.status).json({ error: auth.error });
@@ -112,7 +185,8 @@ router.post('/:taskId', [
     sender_id:   req.user.id,
     sender_type: req.user.role,
     sender_name: senderName,
-    body:        messageBody,
+    body:        messageBody || null,
+    files:       attachedFiles,
     read_by_client_at: req.user.role === 'client' ? nowIso : null,
     read_by_agent_at:  (req.user.role === 'agent' || req.user.role === 'admin') ? nowIso : null,
     created_at:  nowIso,
@@ -129,13 +203,86 @@ router.post('/:taskId', [
     return res.status(500).json({ error: 'Could not send message' });
   }
 
+  /* Refresh signed URLs before returning so the frontend can render the
+     just-sent message with working download links immediately. */
+  const messageWithUrls = { ...message, files: await refreshFileUrls(message.files) };
+
   /* No immediate email on every message — the message notifier worker
      (src/workers/messageNotifier.js) runs every minute and sends a single
      batched notification 15 minutes after the recipient hasn't read it,
      with a 1-email-per-task-per-hour cooldown. See its file for details. */
 
-  logger.info('Message sent', { taskId, senderRole: req.user.role, msgId: message.id });
-  res.status(201).json({ message });
+  logger.info('Message sent', {
+    taskId, senderRole: req.user.role, msgId: message.id,
+    fileCount: attachedFiles.length,
+  });
+  res.status(201).json({ message: messageWithUrls });
+}));
+
+// ── POST /api/messages/:taskId/upload-url ───────────────────────────────────
+// Returns a signed Supabase Storage URL the browser PUTs the file to directly.
+router.post('/:taskId/upload-url', asyncHandler(async (req, res) => {
+  const { taskId } = req.params;
+  const { filename, mime_type, size_bytes } = req.body || {};
+
+  const auth = await authorizeAndLoad(taskId, req.user);
+  if (auth.error) return res.status(auth.status).json({ error: auth.error });
+
+  /* Validate filename + extension */
+  if (!filename || typeof filename !== 'string') {
+    return res.status(400).json({ error: 'filename is required' });
+  }
+  const safeName = filename.toLowerCase();
+  for (const ext of CHAT_BLOCKED_EXTENSIONS) {
+    if (safeName.endsWith(ext)) {
+      return res.status(400).json({ error: `File type ${ext} is not allowed.` });
+    }
+  }
+
+  /* Validate MIME */
+  if (mime_type) {
+    const allowed = CHAT_ALLOWED_MIME_PREFIXES.some(p => mime_type.startsWith(p));
+    if (!allowed) {
+      return res.status(400).json({
+        error: `File type "${mime_type}" is not allowed. Allowed: images, PDFs, Office docs, text, zip.`,
+      });
+    }
+  }
+
+  /* Validate size */
+  if (typeof size_bytes === 'number' && size_bytes > CHAT_MAX_FILE_SIZE_BYTES) {
+    return res.status(400).json({
+      error: `File too large (${Math.round(size_bytes / 1024 / 1024)} MB). Max ${CHAT_MAX_FILE_SIZE_BYTES / 1024 / 1024} MB per file.`,
+    });
+  }
+
+  const extMatch = filename.match(/\.[a-z0-9]{1,8}$/i);
+  const ext = extMatch ? extMatch[0].toLowerCase() : '';
+  const storagePath = `${taskId}/${CHAT_FILES_PATH_PREFIX}/${uuid()}${ext}`;
+
+  const { data, error } = await supabase.storage
+    .from(CHAT_FILES_BUCKET)
+    .createSignedUploadUrl(storagePath);
+
+  if (error) {
+    logger.error('Chat file upload URL failed', {
+      taskId, error: error.message, path: storagePath,
+    });
+    return res.status(500).json({
+      error: 'Could not start file upload. Storage may not be configured.',
+    });
+  }
+
+  res.json({
+    upload_url: data.signedUrl,
+    storage_path: storagePath,
+    file_meta: {
+      name: filename,
+      type: mime_type || 'application/octet-stream',
+      size: size_bytes || 0,
+      storage_path: storagePath,
+    },
+  });
 }));
 
 // ── GET /api/messages/inbox/all ──────────────────────────────────────────────
